@@ -77,7 +77,6 @@ Most microcontroller boards lean on high-pin-count USB MCUs even when the task o
 
 ---
 
-## Known Limitations & Transparency Disclosure
+## Pre-Fabrication Verification Gate
 
-- **AI-Assisted Engineering Disclosure:** This repository was created with AI assistance (`Made with AI` disclosed) and deterministic KiCad 8 / STEP / STL generation tools (`tools/generate.mjs`).
-- **Pre-Fabrication Verification Gate:** Before ordering boards, run KiCad 8 native ERC/DRC on `chirpkey8.kicad_pro`, confirm `ATtiny412-SSNR` (`SOIC-8`) and `PKM13EPYH4000-A0` footprints against current datasheets, and test firmware on a current-limited 3.3V bench supply.
+- Before ordering boards, run KiCad 8 native ERC/DRC on `chirpkey8.kicad_pro`, confirm `ATtiny412-SSNR` (`SOIC-8`) and `PKM13EPYH4000-A0` footprints against current datasheets, and test firmware on a current-limited 3.3V bench supply.

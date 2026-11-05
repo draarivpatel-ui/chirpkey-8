@@ -19,7 +19,7 @@ Defined the 8-pin hardware architecture around the **ATtiny412-SSNR** (`SOIC-8`)
 
 # Session 2 | Schematic and component selection | 2.0 hours
 
-Captured the complete KiCad 8 schematic (`chirpkey8.kicad_sch`) and verified manufacturer part numbers (`ATTINY412-SSNR`, `PKM13EPYH4000-A0`, `PTS645SM43SMTR92LFS`, `LTST-C190KGKT`, and `0603` YAGEO/Samsung passives). Initially considered driving the piezo element single-ended from one GPIO to ground, which limited acoustic output at `3.3 V`; switching to differential complementary drive across `PA1` and `PA2` with a `220 Ω` series damper (`R4`) prevents port overcurrent while boosting acoustic output across the `2.4–4.2 kHz` chirp band.
+Captured the complete KiCad 8 schematic (`chirpkey8.kicad_sch`) and verified manufacturer part numbers (`ATTINY412-SSNR`, `PKM13EPYH4000-A0`, `PTS645SM43SMTR92LFS`, `LTST-C190KGKT`, and `0603` YAGEO/Samsung passives). Initially considered driving the piezo element single-ended from one GPIO to ground, which limited acoustic output at `3.3 V`; switching to differential complementary drive across `PA1` and `PA2` with a `220 Ω` series damper (`R4`) prevents port overcurrent while boosting acoustic output across the `2.4 to 4.2 kHz` chirp band.
 
 ![Session 2 KiCad 8 Schematic and MPN Mapping](assets/session2_schematic.png)
 
