@@ -1,8 +1,9 @@
-// Deterministic KiCad 8 artifact generator. Output is an apply_patch document,
-// never a shell rewrite. Run from the pipeline root and pipe through apply_patch.
+// Deterministic KiCad 8, RS-274X Gerber X2, Excellon drill, and BOM generator.
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deflateRawSync } from 'node:zlib';
 
 const q = JSON.stringify;
 const number = (n) => Number(n.toFixed(4));
@@ -169,6 +170,102 @@ function routeBoard() {
   }
   return { segments,vias };
 }
+const REF_OFFSETS = {
+  U1: [-5.15, 0],
+  BZ1: [0, 0],
+  D1: [0, 1.85],
+  C1: [0, -1.85],
+  R1: [2.7, 0],
+  R2: [-4.2, -1.8],
+  R3: [2.6, 0],
+  R4: [2.6, 0],
+  SW1: [4.0, 0],
+  J1: [0, 4.95],
+  TP1: [0, 5.45]
+};
+
+const SILK_TEXTS = [
+  ['ChirpKey-8', 13.5, 1.25, 0.85],
+  ['v1.0', 13.5, 2.45, 0.65],
+  ['TOUCH', 6.5, 17.8, 0.9],
+  ['SEND', 25.0, 22.55, 0.7],
+  ['GND', 1.7, 3.16, 0.55],
+  ['3V3', 1.7, 5.7, 0.55],
+  ['UPDI', 1.7, 8.24, 0.55],
+  ['ChirpKey-8 v1.0 - Aariv Patel', 16.0, 23.0, 0.6]
+];
+
+const STROKE_FONT = {
+  ' ': [],
+  '-': [[[0.15, 0.5], [0.85, 0.5]]],
+  '.': [[[0.45, 0.0], [0.55, 0.0]], [[0.55, 0.0], [0.55, 0.1]], [[0.55, 0.1], [0.45, 0.1]], [[0.45, 0.1], [0.45, 0.0]]],
+  '0': [[[0.1, 0.0], [0.9, 0.0]], [[0.9, 0.0], [0.9, 1.0]], [[0.9, 1.0], [0.1, 1.0]], [[0.1, 1.0], [0.1, 0.0]], [[0.1, 0.15], [0.9, 0.85]]],
+  '1': [[[0.25, 0.8], [0.5, 1.0]], [[0.5, 1.0], [0.5, 0.0]], [[0.2, 0.0], [0.8, 0.0]]],
+  '2': [[[0.1, 0.8], [0.3, 1.0]], [[0.3, 1.0], [0.8, 1.0]], [[0.8, 1.0], [0.9, 0.8]], [[0.9, 0.8], [0.1, 0.0]], [[0.1, 0.0], [0.9, 0.0]]],
+  '3': [[[0.1, 1.0], [0.9, 1.0]], [[0.9, 1.0], [0.5, 0.55]], [[0.5, 0.55], [0.9, 0.35]], [[0.9, 0.35], [0.75, 0.0]], [[0.75, 0.0], [0.1, 0.0]]],
+  '4': [[[0.75, 0.0], [0.75, 1.0]], [[0.75, 1.0], [0.1, 0.35]], [[0.1, 0.35], [0.95, 0.35]]],
+  '5': [[[0.9, 1.0], [0.15, 1.0]], [[0.15, 1.0], [0.15, 0.55]], [[0.15, 0.55], [0.85, 0.55]], [[0.85, 0.55], [0.85, 0.0]], [[0.85, 0.0], [0.1, 0.0]]],
+  '6': [[[0.85, 1.0], [0.15, 1.0]], [[0.15, 1.0], [0.1, 0.0]], [[0.1, 0.0], [0.9, 0.0]], [[0.9, 0.0], [0.9, 0.5]], [[0.9, 0.5], [0.12, 0.5]]],
+  '7': [[[0.1, 1.0], [0.9, 1.0]], [[0.9, 1.0], [0.4, 0.0]]],
+  '8': [[[0.15, 0.0], [0.85, 0.0]], [[0.85, 0.0], [0.85, 1.0]], [[0.85, 1.0], [0.15, 1.0]], [[0.15, 1.0], [0.15, 0.0]], [[0.15, 0.5], [0.85, 0.5]]],
+  '9': [[[0.15, 0.0], [0.85, 0.0]], [[0.85, 0.0], [0.9, 1.0]], [[0.9, 1.0], [0.1, 1.0]], [[0.1, 1.0], [0.1, 0.5]], [[0.1, 0.5], [0.88, 0.5]]],
+  'A': [[[0.05, 0.0], [0.5, 1.0]], [[0.5, 1.0], [0.95, 0.0]], [[0.22, 0.38], [0.78, 0.38]]],
+  'B': [[[0.1, 0.0], [0.1, 1.0]], [[0.1, 1.0], [0.8, 1.0]], [[0.8, 1.0], [0.9, 0.75]], [[0.9, 0.75], [0.8, 0.52]], [[0.8, 0.52], [0.1, 0.52]], [[0.8, 0.52], [0.92, 0.25]], [[0.92, 0.25], [0.8, 0.0]], [[0.8, 0.0], [0.1, 0.0]]],
+  'C': [[[0.9, 0.85], [0.7, 1.0]], [[0.7, 1.0], [0.25, 1.0]], [[0.25, 1.0], [0.1, 0.75]], [[0.1, 0.75], [0.1, 0.25]], [[0.1, 0.25], [0.25, 0.0]], [[0.25, 0.0], [0.7, 0.0]], [[0.7, 0.0], [0.9, 0.15]]],
+  'D': [[[0.1, 0.0], [0.1, 1.0]], [[0.1, 1.0], [0.7, 1.0]], [[0.7, 1.0], [0.9, 0.75]], [[0.9, 0.75], [0.9, 0.25]], [[0.9, 0.25], [0.7, 0.0]], [[0.7, 0.0], [0.1, 0.0]]],
+  'E': [[[0.9, 1.0], [0.1, 1.0]], [[0.1, 1.0], [0.1, 0.0]], [[0.1, 0.0], [0.9, 0.0]], [[0.1, 0.5], [0.75, 0.5]]],
+  'F': [[[0.9, 1.0], [0.1, 1.0]], [[0.1, 1.0], [0.1, 0.0]], [[0.1, 0.5], [0.75, 0.5]]],
+  'G': [[[0.9, 0.85], [0.7, 1.0]], [[0.7, 1.0], [0.2, 1.0]], [[0.2, 1.0], [0.1, 0.75]], [[0.1, 0.75], [0.1, 0.25]], [[0.1, 0.25], [0.2, 0.0]], [[0.2, 0.0], [0.9, 0.0]], [[0.9, 0.0], [0.9, 0.45]], [[0.9, 0.45], [0.55, 0.45]]],
+  'H': [[[0.1, 0.0], [0.1, 1.0]], [[0.9, 0.0], [0.9, 1.0]], [[0.1, 0.5], [0.9, 0.5]]],
+  'I': [[[0.2, 1.0], [0.8, 1.0]], [[0.5, 1.0], [0.5, 0.0]], [[0.2, 0.0], [0.8, 0.0]]],
+  'J': [[[0.25, 1.0], [0.9, 1.0]], [[0.75, 1.0], [0.75, 0.2]], [[0.75, 0.2], [0.55, 0.0]], [[0.55, 0.0], [0.25, 0.0]], [[0.25, 0.0], [0.1, 0.2]]],
+  'K': [[[0.1, 0.0], [0.1, 1.0]], [[0.9, 1.0], [0.1, 0.48]], [[0.35, 0.64], [0.9, 0.0]]],
+  'L': [[[0.1, 1.0], [0.1, 0.0]], [[0.1, 0.0], [0.9, 0.0]]],
+  'M': [[[0.08, 0.0], [0.08, 1.0]], [[0.08, 1.0], [0.5, 0.35]], [[0.5, 0.35], [0.92, 1.0]], [[0.92, 1.0], [0.92, 0.0]]],
+  'N': [[[0.1, 0.0], [0.1, 1.0]], [[0.1, 1.0], [0.9, 0.0]], [[0.9, 0.0], [0.9, 1.0]]],
+  'O': [[[0.2, 0.0], [0.8, 0.0]], [[0.8, 0.0], [0.92, 0.25]], [[0.92, 0.25], [0.92, 0.75]], [[0.92, 0.75], [0.8, 1.0]], [[0.8, 1.0], [0.2, 1.0]], [[0.2, 1.0], [0.08, 0.75]], [[0.08, 0.75], [0.08, 0.25]], [[0.08, 0.25], [0.2, 0.0]]],
+  'P': [[[0.1, 0.0], [0.1, 1.0]], [[0.1, 1.0], [0.8, 1.0]], [[0.8, 1.0], [0.92, 0.75]], [[0.92, 0.75], [0.8, 0.5]], [[0.8, 0.5], [0.1, 0.5]]],
+  'R': [[[0.1, 0.0], [0.1, 1.0]], [[0.1, 1.0], [0.8, 1.0]], [[0.8, 1.0], [0.92, 0.75]], [[0.92, 0.75], [0.8, 0.5]], [[0.8, 0.5], [0.1, 0.5]], [[0.55, 0.5], [0.92, 0.0]]],
+  'S': [[[0.9, 0.85], [0.75, 1.0]], [[0.75, 1.0], [0.2, 1.0]], [[0.2, 1.0], [0.1, 0.75]], [[0.1, 0.75], [0.2, 0.52]], [[0.2, 0.52], [0.8, 0.48]], [[0.8, 0.48], [0.9, 0.22]], [[0.9, 0.22], [0.75, 0.0]], [[0.75, 0.0], [0.1, 0.0]]],
+  'T': [[[0.05, 1.0], [0.95, 1.0]], [[0.5, 1.0], [0.5, 0.0]]],
+  'U': [[[0.1, 1.0], [0.1, 0.2]], [[0.1, 0.2], [0.25, 0.0]], [[0.25, 0.0], [0.75, 0.0]], [[0.75, 0.0], [0.9, 0.2]], [[0.9, 1.0], [0.9, 0.2]]],
+  'V': [[[0.08, 1.0], [0.5, 0.0]], [[0.5, 0.0], [0.92, 1.0]]],
+  'W': [[[0.05, 1.0], [0.25, 0.0]], [[0.25, 0.0], [0.5, 0.6]], [[0.5, 0.6], [0.75, 0.0]], [[0.75, 0.0], [0.95, 1.0]]],
+  'Z': [[[0.1, 1.0], [0.9, 1.0]], [[0.9, 1.0], [0.1, 0.0]], [[0.1, 0.0], [0.9, 0.0]]],
+  'a': [[[0.2, 0.62], [0.78, 0.62]], [[0.78, 0.62], [0.78, 0.0]], [[0.78, 0.35], [0.2, 0.35]], [[0.2, 0.35], [0.12, 0.18]], [[0.12, 0.18], [0.2, 0.0]], [[0.2, 0.0], [0.78, 0.0]]],
+  'e': [[[0.12, 0.32], [0.88, 0.32]], [[0.88, 0.32], [0.88, 0.55]], [[0.88, 0.55], [0.7, 0.68]], [[0.7, 0.68], [0.25, 0.68]], [[0.25, 0.68], [0.12, 0.5]], [[0.12, 0.5], [0.12, 0.15]], [[0.12, 0.15], [0.28, 0.0]], [[0.28, 0.0], [0.82, 0.0]]],
+  'h': [[[0.15, 1.0], [0.15, 0.0]], [[0.15, 0.55], [0.78, 0.65]], [[0.78, 0.65], [0.85, 0.0]]],
+  'i': [[[0.5, 0.0], [0.5, 0.65]], [[0.5, 0.85], [0.5, 0.98]]],
+  'l': [[[0.4, 1.0], [0.52, 1.0]], [[0.52, 1.0], [0.52, 0.0]], [[0.38, 0.0], [0.68, 0.0]]],
+  'p': [[[0.15, -0.25], [0.15, 0.68]], [[0.15, 0.68], [0.78, 0.68]], [[0.78, 0.68], [0.88, 0.5]], [[0.88, 0.5], [0.78, 0.3]], [[0.78, 0.3], [0.15, 0.3]]],
+  'r': [[[0.2, 0.0], [0.2, 0.68]], [[0.2, 0.52], [0.45, 0.68]], [[0.45, 0.68], [0.82, 0.68]]],
+  't': [[[0.45, 0.95], [0.45, 0.0]], [[0.2, 0.65], [0.78, 0.65]], [[0.45, 0.0], [0.78, 0.0]]],
+  'v': [[[0.12, 0.68], [0.5, 0.0]], [[0.5, 0.0], [0.88, 0.68]]],
+  'y': [[[0.15, 0.68], [0.5, 0.05]], [[0.88, 0.68], [0.3, -0.25]]]
+};
+
+function silkTextSegments(text, cx, cy, size) {
+  const charW = size * 0.6, stepX = size * 0.8;
+  const totalW = text.length ? (text.length - 1) * stepX + charW : 0;
+  const startX = cx - totalW / 2;
+  const out = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const strokes = STROKE_FONT[ch] ?? STROKE_FONT[ch.toUpperCase()];
+    if (!strokes) throw new Error('Missing silkscreen glyph for ' + JSON.stringify(ch));
+    const ox = startX + i * stepX;
+    for (const [[x0, y0], [x1, y1]] of strokes) {
+      out.push([
+        ox + x0 * charW,
+        cy + (0.5 - y0) * size,
+        ox + x1 * charW,
+        cy + (0.5 - y1) * size
+      ]);
+    }
+  }
+  return out;
+}
+
 function line(a,b,layer,uid,width=.15) { return `(fp_line (start ${a[0]} ${a[1]}) (end ${b[0]} ${b[1]}) (stroke (width ${width}) (type default)) (layer ${q(layer)}) (uuid ${id(uid)}))`; }
 function footprint(p) {
   const [w,h]=p.body, uid='fp/'+p.ref;
@@ -185,17 +282,16 @@ function footprint(p) {
   }
   const court=[[minX,minY],[maxX,minY],[maxX,maxY],[minX,maxY]];
   graphics+='\n'+court.map((a,i)=>line(a,court[(i+1)%4],'F.CrtYd',uid+'/court/'+i,.05)).join('\n');
-  const referenceY = p.ref==='BZ1' ? 0 : minY-1;
+  const [refX, refY] = REF_OFFSETS[p.ref];
   return `(footprint ${q(p.footprint)} (layer "F.Cu") (uuid ${id(uid)}) (at ${p.x} ${p.y})
-    ${prop('Reference',p.ref,0,referenceY,false,true)} ${prop('Value',p.value,0,0,true,true)} ${prop('Part Number',p.mpn,0,0,true,true)}
+    ${prop('Reference',p.ref,refX,refY,false,true)} ${prop('Value',p.value,0,0,true,true)} ${prop('Part Number',p.mpn,0,0,true,true)}
     (path ${q('/'+rootId+'/'+id('sym/'+p.ref))}) (attr ${p.ref==='J1'?'through_hole':'smd'}${p.integral?' exclude_from_pos_files exclude_from_bom':''}) ${graphics}
     ${p.pads.map(pad=>`(pad ${q(pad.n)} ${pad.drill?'thru_hole': 'smd'} ${pad.circle?'circle':pad.drill&&pad.n==='1'?'rect':'roundrect'} (at ${pad.x} ${number(pad.y)}) (size ${pad.w} ${pad.h}) ${pad.drill?'(drill '+pad.drill+')':''} (layers ${pad.drill?'"*.Cu" "*.Mask"':pad.covered?'"F.Cu"':'"F.Cu" "F.Paste" "F.Mask"'}) ${!pad.circle&&!(pad.drill&&pad.n==='1')?'(roundrect_rratio .2)':''} (net ${netId(p.connections[pad.n])} ${q(p.connections[pad.n])}) (uuid ${id(uid+'/pad/'+pad.n)}))`).join('\n')})`;
 }
-function makePCB() {
-  const {segments,vias}=routeBoard();
+function makePCB(routed = routeBoard()) {
+  const {segments,vias}=routed;
   const layerList=[[0,'F.Cu','signal'],[31,'B.Cu','signal'],[34,'B.Paste','user'],[35,'F.Paste','user'],[36,'B.SilkS','user'],[37,'F.SilkS','user'],[38,'B.Mask','user'],[39,'F.Mask','user'],[44,'Edge.Cuts','user'],[46,'B.CrtYd','user'],[47,'F.CrtYd','user'],[48,'B.Fab','user'],[49,'F.Fab','user']];
   const edge=[[0,0],[32,0],[32,24],[0,24]];
-  const texts=[['ChirpKey-8',11.5,1.8,1],['v1.0',11.5,2.9,.7],['TOUCH',6.5,17.8,1],['SEND',25,22,.7],['GND',1.7,3.16,.55],['3V3',1.7,5.7,.55],['UPDI',1.7,8.24,.55],['ChirpKey-8 v1.0 — Aariv Patel',16,23.1,.7]];
   return `(kicad_pcb (version 20240108) (generator "chirpkey8_generator") (generator_version "1.0")
     (general (thickness 1.6)) (paper "A4")
     (title_block (title "ChirpKey-8") (rev "1.0") (company "Aariv Patel"))
@@ -204,10 +300,460 @@ function makePCB() {
     ${nets.map((n,i)=>`(net ${i} ${q(n)})`).join('\n')}
     ${parts.map(footprint).join('\n')}
     ${edge.map((p,i)=>`(gr_line (start ${p[0]} ${p[1]}) (end ${edge[(i+1)%4][0]} ${edge[(i+1)%4][1]}) (stroke (width .05) (type default)) (layer "Edge.Cuts") (uuid ${id('edge/'+i)}))`).join('\n')}
-    ${texts.map(([t,x,y,s],i)=>`(gr_text ${q(t)} (at ${x} ${y}) (layer "F.SilkS") (uuid ${id('silk/'+i)}) (effects (font (size ${s} ${s}) (thickness .15))))`).join('\n')}
+    ${SILK_TEXTS.map(([t,x,y,s],i)=>`(gr_text ${q(t)} (at ${x} ${y}) (layer "F.SilkS") (uuid ${id('silk/'+i)}) (effects (font (size ${s} ${s}) (thickness .15))))`).join('\n')}
     ${segments.map((s,i)=>`(segment (start ${s.a.join(' ')}) (end ${s.b.join(' ')}) (width ${s.width}) (layer ${q(s.layer?'B.Cu':'F.Cu')}) (net ${s.net}) (uuid ${id('track/'+i)}))`).join('\n')}
     ${vias.map((v,i)=>`(via (at ${v.x} ${v.y}) (size ${v.size}) (drill ${v.drill}) (layers "F.Cu" "B.Cu") (net ${v.net}) (uuid ${id('via/'+i)}))`).join('\n')})\n`;
 }
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildZip(entries) {
+  const locals = [], centrals = [];
+  let offset = 0;
+  // Fixed DOS timestamp (2026-11-04 00:00:00) keeps chirpkey8-gerbers.zip deterministic.
+  const dosTime = 0x0000, dosDate = ((2026 - 1980) << 9) | (11 << 5) | 4;
+  for (const [name, content] of entries) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const raw = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+    const comp = deflateRawSync(raw, { level: 9 });
+    const crc = crc32(raw);
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4);
+    lh.writeUInt16LE(0, 6);
+    lh.writeUInt16LE(8, 8);
+    lh.writeUInt16LE(dosTime, 10);
+    lh.writeUInt16LE(dosDate, 12);
+    lh.writeUInt32LE(crc, 14);
+    lh.writeUInt32LE(comp.length, 18);
+    lh.writeUInt32LE(raw.length, 22);
+    lh.writeUInt16LE(nameBuf.length, 26);
+    lh.writeUInt16LE(0, 28);
+    locals.push(lh, nameBuf, comp);
+
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0);
+    ch.writeUInt16LE(20, 4);
+    ch.writeUInt16LE(20, 6);
+    ch.writeUInt16LE(0, 8);
+    ch.writeUInt16LE(8, 10);
+    ch.writeUInt16LE(dosTime, 12);
+    ch.writeUInt16LE(dosDate, 14);
+    ch.writeUInt32LE(crc, 16);
+    ch.writeUInt32LE(comp.length, 20);
+    ch.writeUInt32LE(raw.length, 24);
+    ch.writeUInt16LE(nameBuf.length, 28);
+    ch.writeUInt16LE(0, 30);
+    ch.writeUInt16LE(0, 32);
+    ch.writeUInt16LE(0, 34);
+    ch.writeUInt16LE(0, 36);
+    ch.writeUInt32LE(0, 38);
+    ch.writeUInt32LE(offset, 42);
+    centrals.push(ch, nameBuf);
+    offset += lh.length + nameBuf.length + comp.length;
+  }
+  const cdSize = centrals.reduce((s, b) => s + b.length, 0);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(cdSize, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([...locals, ...centrals, eocd]);
+}
+
+function makeGerbers(routed = routeBoard()) {
+  const W = 32, H = 24;
+  const { segments, vias } = routed;
+  const gx = (x) => Math.round(x * 1e6);
+  const gy = (y) => Math.round((H - y) * 1e6);
+
+  // Build deterministic aperture table for traces, vias, silkscreen, outline, and pads.
+  const apDefs = [
+    [10, 'C,0.050000'],
+    [11, 'C,0.150000'],
+    [12, 'C,0.250000'],
+    [13, 'C,0.650000'],
+    [14, 'C,0.120000']
+  ];
+  const padApMap = new Map();
+  let nextCode = 15;
+  for (const p of parts) {
+    for (const pad of p.pads) {
+      const spec = pad.circle
+        ? `C,${pad.w.toFixed(6)}`
+        : `R,${pad.w.toFixed(6)}X${pad.h.toFixed(6)}`;
+      if (!padApMap.has(spec)) {
+        padApMap.set(spec, nextCode);
+        apDefs.push([nextCode, spec]);
+        nextCode++;
+      }
+    }
+  }
+  const padCode = (pad) => padApMap.get(
+    pad.circle ? `C,${pad.w.toFixed(6)}` : `R,${pad.w.toFixed(6)}X${pad.h.toFixed(6)}`
+  );
+
+  const renderGerber = (layerName, fileFn, filePolarity, bodyLines) => [
+    'G04 ChirpKey-8 v1.0 RS-274X Gerber X2 plot*',
+    `G04 Layer: ${layerName}*`,
+    '%FSLAX46Y46*%',
+    '%MOMM*%',
+    '%TF.GenerationSoftware,KiCad,Pcbnew,8.0.0*%',
+    '%TF.ProjectId,chirpkey8,63686972-706b-4579-b82d-763130303030,rev1*%',
+    '%TF.SameCoordinates,Original*%',
+    `%TF.FileFunction,${fileFn}*%`,
+    `%TF.FilePolarity,${filePolarity}*%`,
+    'G01*',
+    ...apDefs.map(([code, def]) => `%ADD${code}${def}*%`),
+    '%LPD*%',
+    ...bodyLines,
+    'M02*',
+    ''
+  ].join('\n');
+
+  const flashPad = (px, py, code) => [`D${code}*`, `X${gx(px)}Y${gy(py)}D03*`];
+  const strokeSeg = (x0, y0, x1, y1, code) => [
+    `D${code}*`,
+    `X${gx(x0)}Y${gy(y0)}D02*`,
+    `X${gx(x1)}Y${gy(y1)}D01*`
+  ];
+
+  // F.Cu: all component pads (including covered TP1), vias, and F.Cu routed tracks.
+  const fCu = [];
+  for (const p of parts) {
+    for (const pad of p.pads) fCu.push(...flashPad(p.x + pad.x, p.y + pad.y, padCode(pad)));
+  }
+  for (const v of vias) fCu.push(...flashPad(v.x, v.y, 13));
+  for (const s of segments.filter(s => s.layer === 0)) {
+    fCu.push(...strokeSeg(s.a[0], s.a[1], s.b[0], s.b[1], 12));
+  }
+
+  // B.Cu: through-hole pads (J1), vias, and B.Cu routed tracks (clear beneath TP1).
+  const bCu = [];
+  for (const p of parts) {
+    for (const pad of p.pads.filter(pd => pd.drill)) {
+      bCu.push(...flashPad(p.x + pad.x, p.y + pad.y, padCode(pad)));
+    }
+  }
+  for (const v of vias) bCu.push(...flashPad(v.x, v.y, 13));
+  for (const s of segments.filter(s => s.layer === 1)) {
+    bCu.push(...strokeSeg(s.a[0], s.a[1], s.b[0], s.b[1], 12));
+  }
+
+  // F.Mask: solder mask openings for all non-covered pads (TP1 stays solder-mask covered).
+  const fMask = [];
+  for (const p of parts) {
+    for (const pad of p.pads.filter(pd => !pd.covered)) {
+      fMask.push(...flashPad(p.x + pad.x, p.y + pad.y, padCode(pad)));
+    }
+  }
+
+  // B.Mask: solder mask openings for through-hole pads (J1) on B.Cu.
+  const bMask = [];
+  for (const p of parts) {
+    for (const pad of p.pads.filter(pd => pd.drill)) {
+      bMask.push(...flashPad(p.x + pad.x, p.y + pad.y, padCode(pad)));
+    }
+  }
+
+  // F.Paste: stencil openings for SMD pads only (excludes through-hole J1 and covered TP1).
+  const fPaste = [];
+  for (const p of parts) {
+    for (const pad of p.pads.filter(pd => !pd.drill && !pd.covered)) {
+      fPaste.push(...flashPad(p.x + pad.x, p.y + pad.y, padCode(pad)));
+    }
+  }
+
+  // F.SilkS: footprint outlines, TP1 9.0 mm ring, visible Reference designators, and board labels.
+  const fSilk = [];
+  for (const p of parts) {
+    if (p.integral) {
+      const segs = 36, r = 4.5;
+      fSilk.push('D11*');
+      fSilk.push(`X${gx(p.x + r)}Y${gy(p.y)}D02*`);
+      for (let i = 1; i <= segs; i++) {
+        const a = (2 * Math.PI * i) / segs;
+        fSilk.push(`X${gx(p.x + r * Math.cos(a))}Y${gy(p.y + r * Math.sin(a))}D01*`);
+      }
+    } else {
+      const [bw, bh] = p.body;
+      const minX = p.x + Math.min(-bw / 2, ...p.pads.map(pd => pd.x - pd.w / 2)) - 0.25;
+      const maxX = p.x + Math.max(bw / 2, ...p.pads.map(pd => pd.x + pd.w / 2)) + 0.25;
+      const minY = p.y + Math.min(-bh / 2, ...p.pads.map(pd => pd.y - pd.h / 2)) - 0.40;
+      const maxY = p.y + Math.max(bh / 2, ...p.pads.map(pd => pd.y + pd.h / 2)) + 0.40;
+      fSilk.push(...strokeSeg(minX, minY, maxX, minY, 11));
+      fSilk.push(...strokeSeg(minX, maxY, maxX, maxY, 11));
+    }
+    const [refX, refY] = REF_OFFSETS[p.ref];
+    fSilk.push(`G04 SilkRef: ${p.ref}*`);
+    for (const [x0, y0, x1, y1] of silkTextSegments(p.ref, p.x + refX, p.y + refY, 0.7)) {
+      fSilk.push(...strokeSeg(x0, y0, x1, y1, 14));
+    }
+  }
+  for (const [label, tx, ty, ts] of SILK_TEXTS) {
+    fSilk.push(`G04 SilkText: ${label}*`);
+    for (const [x0, y0, x1, y1] of silkTextSegments(label, tx, ty, ts)) {
+      fSilk.push(...strokeSeg(x0, y0, x1, y1, 14));
+    }
+  }
+
+  // B.SilkS: rear registration border mark clear of drills.
+  const bSilk = [
+    ...strokeSeg(8.0, 22.8, 24.0, 22.8, 11)
+  ];
+
+  // Edge.Cuts: closed 32.0 x 24.0 mm board profile.
+  const edgeCuts = [
+    'D10*',
+    `X${gx(0)}Y${gy(0)}D02*`,
+    `X${gx(W)}Y${gy(0)}D01*`,
+    `X${gx(W)}Y${gy(H)}D01*`,
+    `X${gx(0)}Y${gy(H)}D01*`,
+    `X${gx(0)}Y${gy(0)}D01*`
+  ];
+
+  // Excellon PTH drill: 10 plated vias (0.300 mm) + 3 J1 header holes (1.000 mm).
+  const j1 = parts.find(p => p.ref === 'J1');
+  const drlLines = [
+    'M48',
+    '; DRILL file {KiCad 8.0.0} ChirpKey-8 v1.0',
+    '; #@! TF.FileFunction,Plated,1,2,PTH',
+    'FMAT,2',
+    'METRIC,TZ',
+    'T1C0.300',
+    'T2C1.000',
+    '%',
+    'G90',
+    'G05',
+    'T1',
+    ...vias.map(v => `X${v.x.toFixed(4)}Y${(H - v.y).toFixed(4)}`),
+    'T2',
+    ...j1.pads.map(pd => `X${(j1.x + pd.x).toFixed(4)}Y${(H - (j1.y + pd.y)).toFixed(4)}`),
+    'T0',
+    'M30',
+    ''
+  ].join('\n');
+
+  const gerberFiles = {
+    'gerbers/chirpkey8-F_Cu.gbr': renderGerber('F.Cu', 'Copper,L1,Top', 'Positive', fCu),
+    'gerbers/chirpkey8-B_Cu.gbr': renderGerber('B.Cu', 'Copper,L2,Bot', 'Positive', bCu),
+    'gerbers/chirpkey8-F_Mask.gbr': renderGerber('F.Mask', 'Soldermask,Top', 'Negative', fMask),
+    'gerbers/chirpkey8-B_Mask.gbr': renderGerber('B.Mask', 'Soldermask,Bot', 'Negative', bMask),
+    'gerbers/chirpkey8-F_Paste.gbr': renderGerber('F.Paste', 'Paste,Top', 'Positive', fPaste),
+    'gerbers/chirpkey8-B_Paste.gbr': renderGerber('B.Paste', 'Paste,Bot', 'Positive', []),
+    'gerbers/chirpkey8-F_SilkS.gbr': renderGerber('F.SilkS', 'Legend,Top', 'Positive', fSilk),
+    'gerbers/chirpkey8-B_SilkS.gbr': renderGerber('B.SilkS', 'Legend,Bot', 'Positive', bSilk),
+    'gerbers/chirpkey8-Edge_Cuts.gbr': renderGerber('Edge.Cuts', 'Profile,NP', 'Positive', edgeCuts),
+    'gerbers/chirpkey8.drl': drlLines
+  };
+  const zipEntries = Object.entries(gerberFiles).map(([rel, txt]) => [rel.replace('gerbers/', ''), txt]);
+  return { ...gerberFiles, 'chirpkey8-gerbers.zip': buildZip(zipEntries) };
+}
+
+function makeEnclosure() {
+  // 36.0 x 28.0 x 7.6 mm snap-fit pocket enclosure on a unified grid:
+  // - 1.8 mm outer walls -> 32.4 x 24.4 x 4.2 mm upper board + component pocket (0.20 mm radial clearance/side for 32 x 24 mm PCB)
+  // - 1.2 mm perimeter PCB support ledge at Z = 3.4 mm -> 30.0 x 22.0 x 1.6 mm under-board solder/lead clearance well (Z = 1.8..3.4 mm)
+  // - Two centered 8.0 mm opposing snap-fit retaining clips (X = 14.0..22.0 mm) on the flexible 32.4 mm front/back walls:
+  //   0.45 mm inward projection (23.50 mm throat -> 0.25 mm/side overlap over 24.00 mm PCB), locking shelf at Z = 5.10 mm
+  //   (0.10 mm vertical clearance above seated 1.60 mm FR-4 board at Z = 3.40..5.00 mm), 0.25 mm crest (Z = 5.10..5.35 mm),
+  //   and 45-degree chamfered lead-in ramps (Z = 5.35..5.80 mm)
+  // - 1.8 mm solid floor (Z = 0.0..1.8 mm)
+  const XS = [0.0, 1.8, 3.0, 14.0, 22.0, 33.0, 34.2, 36.0];
+  const YS = [0.0, 1.8, 2.25, 3.0, 25.0, 25.75, 26.2, 28.0];
+  const ZS = [0.0, 1.8, 3.4, 5.1, 5.35, 5.8, 7.6];
+  const NX_E = XS.length - 1, NY_E = YS.length - 1, NZ_E = ZS.length - 1;
+  const INV_SQRT2 = Math.SQRT1_2;
+
+  const solid = (ix, iy, iz) => {
+    if (ix < 0 || ix >= NX_E || iy < 0 || iy >= NY_E || iz < 0 || iz >= NZ_E) return false;
+    if (iz === 0) return true;
+    if (iz === 1) return !(ix >= 2 && ix <= 4 && iy === 3);
+    if (iz === 3 && ix === 3 && (iy === 1 || iy === 5)) return true;
+    return ix === 0 || ix === NX_E - 1 || iy === 0 || iy === NY_E - 1;
+  };
+  const isFrontRamp = (ix, iy, iz) => ix === 3 && iy === 1 && iz === 4;
+  const isBackRamp = (ix, iy, iz) => ix === 3 && iy === 5 && iz === 4;
+  const hasRamp = (ix, iy, iz) => isFrontRamp(ix, iy, iz) || isBackRamp(ix, iy, iz);
+
+  const vertIndex = new Map();
+  const verts = [];
+  const getV = (i, j, k) => {
+    const key = `${i},${j},${k}`;
+    let idx = vertIndex.get(key);
+    if (idx === undefined) {
+      idx = verts.length;
+      vertIndex.set(key, idx);
+      verts.push([XS[i], YS[j], ZS[k]]);
+    }
+    return idx;
+  };
+
+  const polys = [];
+  for (let iz = 0; iz < NZ_E; iz++) {
+    for (let iy = 0; iy < NY_E; iy++) {
+      for (let ix = 0; ix < NX_E; ix++) {
+        if (!solid(ix, iy, iz)) continue;
+        if (!solid(ix, iy, iz - 1)) {
+          polys.push({ vs: [getV(ix, iy, iz), getV(ix, iy + 1, iz), getV(ix + 1, iy + 1, iz), getV(ix + 1, iy, iz)], n: [0, 0, -1], ref: [0, 1, 0] });
+        }
+        if (!solid(ix, iy, iz + 1) && !hasRamp(ix, iy, iz + 1)) {
+          polys.push({ vs: [getV(ix, iy, iz + 1), getV(ix + 1, iy, iz + 1), getV(ix + 1, iy + 1, iz + 1), getV(ix, iy + 1, iz + 1)], n: [0, 0, 1], ref: [1, 0, 0] });
+        }
+        if (!solid(ix, iy - 1, iz) && !isBackRamp(ix, iy - 1, iz)) {
+          polys.push({ vs: [getV(ix, iy, iz), getV(ix + 1, iy, iz), getV(ix + 1, iy, iz + 1), getV(ix, iy, iz + 1)], n: [0, -1, 0], ref: [1, 0, 0] });
+        }
+        if (!solid(ix, iy + 1, iz) && !isFrontRamp(ix, iy + 1, iz)) {
+          polys.push({ vs: [getV(ix + 1, iy + 1, iz), getV(ix, iy + 1, iz), getV(ix, iy + 1, iz + 1), getV(ix + 1, iy + 1, iz + 1)], n: [0, 1, 0], ref: [-1, 0, 0] });
+        }
+        if (!solid(ix - 1, iy, iz)) {
+          polys.push({ vs: [getV(ix, iy + 1, iz), getV(ix, iy, iz), getV(ix, iy, iz + 1), getV(ix, iy + 1, iz + 1)], n: [-1, 0, 0], ref: [0, -1, 0] });
+        }
+        if (!solid(ix + 1, iy, iz)) {
+          polys.push({ vs: [getV(ix + 1, iy, iz), getV(ix + 1, iy + 1, iz), getV(ix + 1, iy + 1, iz + 1), getV(ix + 1, iy, iz + 1)], n: [1, 0, 0], ref: [0, 1, 0] });
+        }
+      }
+    }
+  }
+
+  // Front snap-clip 45-degree lead-in wedge (ix = 3, iy = 1, iz = 4).
+  polys.push(
+    { vs: [getV(3, 1, 5), getV(4, 1, 5), getV(4, 2, 4), getV(3, 2, 4)], n: [0, INV_SQRT2, INV_SQRT2], ref: [1, 0, 0] },
+    { vs: [getV(3, 1, 4), getV(3, 1, 5), getV(3, 2, 4)], n: [-1, 0, 0], ref: [0, 0, 1] },
+    { vs: [getV(4, 1, 4), getV(4, 2, 4), getV(4, 1, 5)], n: [1, 0, 0], ref: [0, 1, 0] }
+  );
+  // Back snap-clip 45-degree lead-in wedge (ix = 3, iy = 5, iz = 4).
+  polys.push(
+    { vs: [getV(4, 6, 5), getV(3, 6, 5), getV(3, 5, 4), getV(4, 5, 4)], n: [0, -INV_SQRT2, INV_SQRT2], ref: [-1, 0, 0] },
+    { vs: [getV(3, 6, 4), getV(3, 5, 4), getV(3, 6, 5)], n: [-1, 0, 0], ref: [0, -1, 0] },
+    { vs: [getV(4, 6, 4), getV(4, 6, 5), getV(4, 5, 4)], n: [1, 0, 0], ref: [0, 0, 1] }
+  );
+
+  // ASCII STL (1 triangle per triangular cap, 2 triangles per quad, outward unit normals).
+  const stlLines = ['solid chirpkey8_enclosure'];
+  for (const poly of polys) {
+    const [nx, ny, nz] = poly.n;
+    const pts = poly.vs.map(idx => verts[idx]);
+    const triList = pts.length === 3 ? [[pts[0], pts[1], pts[2]]] : [[pts[0], pts[1], pts[2]], [pts[0], pts[2], pts[3]]];
+    for (const [p0, p1, p2] of triList) {
+      stlLines.push(`  facet normal ${nx.toFixed(6)} ${ny.toFixed(6)} ${nz.toFixed(6)}`);
+      stlLines.push('    outer loop');
+      for (const pt of [p0, p1, p2]) {
+        stlLines.push(`      vertex ${pt[0].toFixed(4)} ${pt[1].toFixed(4)} ${pt[2].toFixed(4)}`);
+      }
+      stlLines.push('    endloop');
+      stlLines.push('  endfacet');
+    }
+  }
+  stlLines.push('endsolid chirpkey8_enclosure', '');
+
+  // ISO-10303-21 AP214 STEP B-rep (MANIFOLD_SOLID_BREP / CLOSED_SHELL of planar ADVANCED_FACEs).
+  const fmtNum = (v) => {
+    const r = Number(v.toFixed(6));
+    return Number.isInteger(r) ? `${r}.` : String(r);
+  };
+  const fmtVec = ([x, y, z]) => `(${fmtNum(x)},${fmtNum(y)},${fmtNum(z)})`;
+  const stepEntities = [
+    "APPLICATION_CONTEXT('automotive design')",
+    "APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#1)",
+    "PRODUCT_CONTEXT('',#1,'mechanical')",
+    "PRODUCT('chirpkey8_enclosure','ChirpKey-8 Pocket Enclosure','',(#3))",
+    "PRODUCT_DEFINITION_FORMATION('1','',#4)",
+    "PRODUCT_DEFINITION_CONTEXT('part definition',#1,'design')",
+    "PRODUCT_DEFINITION('design','',#5,#6)",
+    "PRODUCT_DEFINITION_SHAPE('','',#7)",
+    "(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.))",
+    "(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.))",
+    "(NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT())",
+    "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(0.000001),#9,'distance_accuracy_value','')",
+    "(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#12)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#9,#10,#11)) REPRESENTATION_CONTEXT('',''))"
+  ];
+  const addEnt = (expr) => {
+    stepEntities.push(expr);
+    return `#${stepEntities.length}`;
+  };
+
+  const cartIds = verts.map(pt => addEnt(`CARTESIAN_POINT('',${fmtVec(pt)})`));
+  const vtxIds = cartIds.map(cid => addEnt(`VERTEX_POINT('',${cid})`));
+
+  const edgeMap = new Map();
+  const getEdge = (u, v) => {
+    const a = Math.min(u, v), b = Math.max(u, v);
+    const key = `${a},${b}`;
+    let eid = edgeMap.get(key);
+    if (!eid) {
+      const pa = verts[a], pb = verts[b];
+      const dx = pb[0] - pa[0], dy = pb[1] - pa[1], dz = pb[2] - pa[2];
+      const len = Math.hypot(dx, dy, dz);
+      const dirId = addEnt(`DIRECTION('',${fmtVec([dx / len, dy / len, dz / len])})`);
+      const vecId = addEnt(`VECTOR('',${dirId},1.)`);
+      const lineId = addEnt(`LINE('',${cartIds[a]},${vecId})`);
+      eid = addEnt(`EDGE_CURVE('',${vtxIds[a]},${vtxIds[b]},${lineId},.T.)`);
+      edgeMap.set(key, eid);
+    }
+    return { eid, sense: u < v ? '.T.' : '.F.' };
+  };
+
+  const faceIds = [];
+  for (const poly of polys) {
+    const oEdges = [];
+    for (let i = 0; i < poly.vs.length; i++) {
+      const u = poly.vs[i], v = poly.vs[(i + 1) % poly.vs.length];
+      const { eid, sense } = getEdge(u, v);
+      oEdges.push(addEnt(`ORIENTED_EDGE('',*,*,${eid},${sense})`));
+    }
+    const loopId = addEnt(`EDGE_LOOP('',(${oEdges.join(',')}))`);
+    const boundId = addEnt(`FACE_OUTER_BOUND('',${loopId},.T.)`);
+    const normId = addEnt(`DIRECTION('',${fmtVec(poly.n)})`);
+    const refId = addEnt(`DIRECTION('',${fmtVec(poly.ref)})`);
+    const axId = addEnt(`AXIS2_PLACEMENT_3D('',${cartIds[poly.vs[0]]},${normId},${refId})`);
+    const planeId = addEnt(`PLANE('',${axId})`);
+    faceIds.push(addEnt(`ADVANCED_FACE('',(${boundId}),${planeId},.T.)`));
+  }
+
+  const shellId = addEnt(`CLOSED_SHELL('',(${faceIds.join(',')}))`);
+  const brepId = addEnt(`MANIFOLD_SOLID_BREP('chirpkey8_enclosure',${shellId})`);
+  const shapeRepId = addEnt(`ADVANCED_BREP_SHAPE_REPRESENTATION('chirpkey8_enclosure',(${brepId}),#13)`);
+  addEnt(`SHAPE_DEFINITION_REPRESENTATION(#8,${shapeRepId})`);
+
+  const stepText = [
+    'ISO-10303-21;',
+    'HEADER;',
+    "FILE_DESCRIPTION(('Parametric 36x28x7.6 mm ChirpKey-8 pocket enclosure manifold B-rep'),'2;1');",
+    "FILE_NAME('chirpkey8_enclosure.step','2026-11-04T00:00:00',('Aariv Patel'),('ChirpKey-8'),'ChirpKey-8 Generator','ChirpKey-8 Generator','');",
+    "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));",
+    'ENDSEC;',
+    'DATA;',
+    ...stepEntities.map((expr, idx) => `#${idx + 1}=${expr};`),
+    'ENDSEC;',
+    'END-ISO-10303-21;',
+    ''
+  ].join('\n');
+
+  return {
+    'cad/chirpkey8_enclosure.stl': stlLines.join('\n'),
+    'cad/chirpkey8_enclosure.step': stepText
+  };
+}
+
 function makeBOM() {
   const grouped=new Map();
   for(const p of parts) {
@@ -221,18 +767,42 @@ function makeBOM() {
     pricing:{status:'estimate-not-exact-vendor-quote',partsAndPCB:(cents/100).toFixed(2),shippingAllowance:'5.00',taxAllowance:'0.96',estimatedTotal:((cents+500+96)/100).toFixed(2),target:'18.40',grantCap:'35.00',exactQuoteVerified:false,disclosure:'Component prices and shipping/tax allowances are planning estimates, not live DigiKey/Mouser quotes. Supplier pages were blocked. OSH Park publishes $5/sq in for THREE boards; 32*24/25.4^2*5 rounds to $5.95 per lot. Refresh checkout quotes before submission or ordering.'}};
 }
 export function generatePack() {
+  const routed=routeBoard();
   const bom=makeBOM();
   const project={meta:{filename:'chirpkey8.kicad_pro',version:1},board:{design_settings:{defaults:{board_outline_line_width:.05,copper_line_width:.25},rules:{min_clearance:.2,min_track_width:.25,min_via_diameter:.65,min_through_hole_diameter:.3,min_copper_edge_clearance:.4,min_via_annular_width:.15,solder_mask_clearance:0,solder_mask_min_width:.1016},rule_severities:{},track_widths:[.25,.4],via_dimensions:[{diameter:.65,drill:.3}]}},net_settings:{classes:[{name:'Default',clearance:.2,track_width:.25,via_diameter:.65,via_drill:.3,microvia_diameter:.3,microvia_drill:.1}],meta:{version:3},netclass_assignments:{},netclass_patterns:[]},schematic:{drawing:{default_line_thickness:6,default_text_size:50},meta:{version:1}},sheets:[[rootId,'ChirpKey-8']],text_variables:{PROJECT_NAME:'ChirpKey-8'}};
   const csvCell=s=>'"'+String(s).replaceAll('"','""')+'"';
   const csv=['Reference,Part Number,Manufacturer,Description,Quantity,Unit Price USD,Line Total USD,Supplier,Price Status,Source URL',...bom.rows.map(r=>[r.references.join(' '),r.partNumber,r.manufacturer,r.description,r.quantity,r.unitPrice,r.lineTotal,r.supplier,r.quoteStatus,r.sourceUrl].map(csvCell).join(','))].join('\n')+'\n';
-  return {'chirpkey8.kicad_pro':JSON.stringify(project,null,2)+'\n','chirpkey8.kicad_sch':makeSchematic(),'chirpkey8.kicad_pcb':makePCB(),'bom.json':JSON.stringify(bom,null,2)+'\n','bom.csv':csv};
+  return {
+    'chirpkey8.kicad_pro':JSON.stringify(project,null,2)+'\n',
+    'chirpkey8.kicad_sch':makeSchematic(),
+    'chirpkey8.kicad_pcb':makePCB(routed),
+    'bom.json':JSON.stringify(bom,null,2)+'\n',
+    'bom.csv':csv,
+    ...makeGerbers(routed),
+    ...makeEnclosure()
+  };
 }
 if(process.argv[1]===fileURLToPath(import.meta.url)) {
   const generated=generatePack(),prefix='artifacts/eight-pin-grant-pack/';
-  if(process.argv.includes('--check')) {
-    for(const[name,text]of Object.entries(generated)) if(readFileSync(new URL('../'+name,import.meta.url),'utf8')!==text)throw new Error('Stale generated file '+name);
-    console.log('All five generated files match their deterministic source.');
+  if(process.argv.includes('--write')) {
+    for(const[name,content]of Object.entries(generated)) {
+      const target=fileURLToPath(new URL('../'+name,import.meta.url));
+      mkdirSync(dirname(target),{recursive:true});
+      writeFileSync(target,content,Buffer.isBuffer(content)?undefined:'utf8');
+    }
+    console.log(`Wrote ${Object.keys(generated).length} deterministic files.`);
+  } else if(process.argv.includes('--check')) {
+    for(const[name,content]of Object.entries(generated)) {
+      const target=new URL('../'+name,import.meta.url);
+      if(Buffer.isBuffer(content)) {
+        if(!readFileSync(target).equals(content))throw new Error('Stale generated binary '+name);
+      } else if(readFileSync(target,'utf8')!==content) {
+        throw new Error('Stale generated file '+name);
+      }
+    }
+    console.log(`All ${Object.keys(generated).length} generated files match their deterministic source.`);
   } else if(process.argv.includes('--emit-patch')) {
-    console.log('*** Begin Patch\n'+Object.entries(generated).map(([name,text])=>'*** Add File: '+prefix+name+'\n'+text.trimEnd().split('\n').map(l=>'+'+l).join('\n')).join('\n')+'\n*** End Patch');
-  } else throw new Error('Use --check or --emit-patch.');
+    const textEntries=Object.entries(generated).filter(([,v])=>!Buffer.isBuffer(v));
+    console.log('*** Begin Patch\n'+textEntries.map(([name,text])=>'*** Add File: '+prefix+name+'\n'+text.trimEnd().split('\n').map(l=>'+'+l).join('\n')).join('\n')+'\n*** End Patch');
+  } else throw new Error('Use --write, --check, or --emit-patch.');
 }
