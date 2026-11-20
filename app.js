@@ -1,4 +1,5 @@
-import { boardModel, schematicModel, validateBOM, safeSupplierURL, child, children } from './core.js';
+import { boardModel, schematicModel, validateBOM, safeSupplierURL, child, children,
+  FSK, carrierHz, encodeFrame, frameBits, synthesize, addAwgn, attackBit, decodeFrame, spectrogram } from './core.js';
 
 const $ = id => document.getElementById(id);
 const ns = 'http://www.w3.org/2000/svg';
@@ -64,7 +65,9 @@ async function start() {
   }
   function renderPCB() {
     const root = $('pcb-svg'); root.replaceChildren(); root.setAttribute('viewBox', view.join(' '));
-    root.append(svg('rect', { x: 0, y: 0, width: 32, height: 24, rx: .3, fill: '#15352e' }));
+    const bx = Math.min(...board.outline.flatMap(l => [l.a[0], l.b[0]])), by = Math.min(...board.outline.flatMap(l => [l.a[1], l.b[1]]));
+    root.append(svg('rect', { x: bx, y: by, width: Math.max(...board.outline.flatMap(l => [l.a[0], l.b[0]])) - bx,
+      height: Math.max(...board.outline.flatMap(l => [l.a[1], l.b[1]])) - by, rx: .3, fill: '#15352e' }));
     const net = $('net-filter').value, front = $('front-layer').checked, back = $('back-layer').checked;
     const opacity = id => !net || String(id) === net ? 1 : .16;
     for (const segment of board.segments) {
@@ -83,7 +86,7 @@ async function start() {
         width: Math.max(...padXs) - Math.min(...padXs) + 2, height: Math.max(...padYs) - Math.min(...padYs) + 2,
         fill: 'transparent', stroke: '#a9bbb5', 'stroke-width': .12 }));
       for (const pad of fp.pads) {
-        if (!pad.layers.includes('*.Cu') && !pad.layers.some(l => l === 'F.Cu' ? front : l === 'B.Cu' && back)) continue;
+        if (pad.layers.includes('*.Cu') ? !(front || back) : !pad.layers.some(l => l === 'F.Cu' ? front : l === 'B.Cu' && back)) continue;
         group.append(svg('rect', { x: pad.x - pad.w / 2, y: pad.y - pad.h / 2, width: pad.w, height: pad.h,
           rx: pad.shape === 'circle' || pad.shape === 'oval' ? Math.min(pad.w, pad.h) / 2 : .12,
           fill: '#e4ce8b', opacity: opacity(pad.net) }));
@@ -143,6 +146,8 @@ async function start() {
     $('bom-count').textContent = `${rows.length} of ${bom.rows.length} BOM rows. Totals always include all rows.`;
   }
   $('estimate').textContent = `${money(budget.total)} estimated total`;
+  wbTruth.bom = `BOM ${money(budget.subtotal)} parts + PCB, ${money(budget.total)} estimated total, inside the $18.40 target and $35.00 grant cap.`;
+  renderTruth();
   for (const [name, amount] of [['Parts + PCB', budget.subtotal], ['Shipping allowance', BigInt(bom.pricing.shippingAllowance.replace('.', ''))], ['Tax allowance', BigInt(bom.pricing.taxAllowance.replace('.', ''))], ['Estimated total', budget.total]]) field($('totals'), name, money(amount));
   const tabs = [...document.querySelectorAll('[data-tab]')];
   function activate(tab, focus = false) {
@@ -191,6 +196,183 @@ async function start() {
   $('explorer').hidden = false;
   $('status').textContent = `Loaded ${board.footprints.length} footprints, ${board.segments.length} routed segments and ${schematic.symbols.length} symbols from the local KiCad files. Preview only, not ERC/DRC.`;
 }
+
+// ---------------- Acoustic FSK workbench ----------------
+// One click synthesizes the exact frame the ATtiny412 firmware emits,
+// optionally degrades it with room noise, clock drift or a jammed symbol,
+// then decodes it with the same Goertzel + CRC-8 chain a laptop mic would use.
+const wb = { seq: 0, lastSeen: -1, last: null, audio: null };
+const wbTruth = { bom: '' };
+const TONE = { mark: '#c8ec86', space: '#75b8ee' };
+const ROLE_COLOR = { preamble: '#5d6f68', sync: '#f2b675', payload: '#c8ec86', crc: '#e4ce8b' };
+const hex2 = b => (b >>> 0).toString(16).padStart(2, '0').toUpperCase();
+
+function renderTruth(extra = '') {
+  const m = carrierHz(FSK.markHz), s = carrierHz(FSK.spaceHz);
+  $('wb-truth').textContent = `Decoded live in this page from the firmware bitstream itself: ${m.hz.toFixed(1)} Hz mark (CCMP ${m.ccmp}), ${s.hz.toFixed(1)} Hz space (CCMP ${s.ccmp}), 62.5 baud MSB-first, 11 bytes in 1.408 s. ${wbTruth.bom} ${extra}`.trim();
+}
+
+function fitCanvas(canvas, cssH) {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.max(2, Math.round(canvas.clientWidth || canvas.parentElement.clientWidth || 600));
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(cssH * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, w, cssH];
+}
+
+function drawWave(samples, res) {
+  const [ctx, w, h] = fitCanvas($('wave'), 140);
+  ctx.fillStyle = '#122121'; ctx.fillRect(0, 0, w, h);
+  const mid = h / 2, n = samples.length;
+  const bitOf = s => Math.floor((s - res.startSample) / res.symbolSamples);
+  for (let px = 0; px < w; px++) {
+    const s0 = Math.floor(px / w * n), s1 = Math.max(s0 + 1, Math.ceil((px + 1) / w * n));
+    const step = Math.max(1, Math.floor((s1 - s0) / 12));
+    let mn = Infinity, mx = -Infinity;
+    for (let s = s0; s < s1 && s < n; s += step) { if (samples[s] < mn) mn = samples[s]; if (samples[s] > mx) mx = samples[s]; }
+    const b = bitOf(s0);
+    ctx.strokeStyle = b >= 0 && b < res.bits.length ? (res.bits[b] ? TONE.mark : TONE.space) : '#3d4c48';
+    ctx.globalAlpha = b >= 0 && b < res.bits.length ? .9 : .45;
+    ctx.beginPath(); ctx.moveTo(px + .5, mid + mn * mid * .92); ctx.lineTo(px + .5, mid + mx * mid * .92); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = 'rgba(230,238,233,.14)';
+  for (let b = 8; b < res.bits.length; b += 8) {
+    const x = (res.startSample + b * res.symbolSamples) / n * w;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+}
+
+function drawGoertzel(res, truthBits) {
+  const [ctx, w, h] = fitCanvas($('goertzel'), 160);
+  ctx.fillStyle = '#122121'; ctx.fillRect(0, 0, w, h);
+  const syms = res.symbols;
+  if (!syms.length) return;
+  const maxE = Math.max(...syms.map(s => Math.max(s.mark, s.space)), 1e-9);
+  const mid = h / 2, bw = w / syms.length;
+  for (let i = 0; i < syms.length; i++) {
+    const s = syms[i], wrong = truthBits && truthBits[i] && truthBits[i].bit !== s.bit;
+    const mh = Math.sqrt(s.mark / maxE) * (mid - 14), sh = Math.sqrt(s.space / maxE) * (mid - 14);
+    ctx.fillStyle = wrong ? '#e0705c' : TONE.mark;
+    ctx.fillRect(i * bw + .5, mid - mh, Math.max(1, bw - 1), mh);
+    ctx.fillStyle = wrong ? '#e0705c' : TONE.space;
+    ctx.fillRect(i * bw + .5, mid, Math.max(1, bw - 1), sh);
+  }
+  ctx.strokeStyle = 'rgba(230,238,233,.35)';
+  ctx.beginPath(); ctx.moveTo(0, mid + .5); ctx.lineTo(w, mid + .5); ctx.stroke();
+  ctx.fillStyle = '#a9bbb5'; ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('mark', 6, 12); ctx.fillText('space', 6, h - 4);
+  ctx.fillStyle = 'rgba(230,238,233,.25)';
+  for (let b = 8; b < syms.length; b += 8) ctx.fillRect(b * bw - .5, 0, 1, h);
+}
+
+function drawSpectro(samples) {
+  const [ctx, w, h] = fitCanvas($('spectro'), 140);
+  ctx.fillStyle = '#122121'; ctx.fillRect(0, 0, w, h);
+  const spec = spectrogram(samples, { sampleRate: 48000, size: 1024, hop: 384, minHz: 1600, maxHz: 4400 });
+  if (!spec.cols.length) return;
+  let lo = Infinity, hi = -Infinity;
+  for (const c of spec.cols) for (const v of c) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const cw = w / spec.cols.length, bh = h / spec.cols[0].length;
+  const ramp = t => {
+    const x = Math.min(1, Math.max(0, t));
+    if (x < .45) { const u = x / .45; return `rgb(${18 + u * 28},${33 + u * 60},${33 + u * 41})`; }
+    if (x < .8) { const u = (x - .45) / .35; return `rgb(${46 + u * 154},${93 + u * 143},${74 + u * 60})`; }
+    const u = (x - .8) / .2; return `rgb(${200 + u * 55},${236 + u * 19},${134 + u * 121})`;
+  };
+  spec.cols.forEach((col, x) => {
+    for (let y = 0; y < col.length; y++) {
+      ctx.fillStyle = ramp((col[y] - lo) / (hi - lo || 1));
+      ctx.fillRect(x * cw, h - (y + 1) * bh, Math.ceil(cw), Math.ceil(bh));
+    }
+  });
+  for (const [hz, name] of [[2400, '2400 Hz space'], [3600, '3600 Hz mark']]) {
+    const y = h - (hz / 48000 * spec.size - spec.lo) * bh;
+    ctx.strokeStyle = 'rgba(230,238,233,.5)'; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#e6eee9'; ctx.font = '10px ui-monospace,monospace'; ctx.fillText(name, 6, y - 3);
+  }
+}
+
+function renderFrameMap(res, truthBits, reveal) {
+  const el = $('framemap'); el.replaceChildren();
+  const names = ['PRE', 'PRE', 'PRE', 'PRE', 'SYNC', 'ID', 'ID', 'ID', 'ID', 'SEQ', 'CRC'];
+  const roles = ['preamble', 'preamble', 'preamble', 'preamble', 'sync', 'payload', 'payload', 'payload', 'payload', 'payload', 'crc'];
+  for (let b = 0; b < FSK.frameBytes; b++) {
+    const card = document.createElement('div');
+    card.className = `byte ${roles[b]}${roles[b] === 'crc' ? (res.crcOk ? ' ok' : ' fail') : ''}`;
+    const head = document.createElement('div'); head.className = 'byte-head';
+    head.innerHTML = `<span>${names[b]}</span><span>${b < res.bytes.length ? '0x' + hex2(res.bytes[b]) : '--'}</span>`;
+    const row = document.createElement('div'); row.className = 'bits';
+    for (let k = 0; k < 8; k++) {
+      const i = b * 8 + k, chip = document.createElement('span');
+      chip.className = 'bit';
+      const val = i < res.bits.length ? res.bits[i] : '?';
+      chip.textContent = val;
+      chip.style.background = ROLE_COLOR[res.symbols[i]?.role] || '#617770';
+      if (truthBits?.[i] && truthBits[i].bit !== val) chip.classList.add('err');
+      if (reveal) { chip.classList.add('hide'); chip.style.transitionDelay = `${i * 9}ms`; }
+      row.append(chip);
+    }
+    card.append(head, row); el.append(card);
+  }
+  if (reveal) requestAnimationFrame(() => requestAnimationFrame(() => el.querySelectorAll('.bit.hide').forEach(c => c.classList.remove('hide'))));
+}
+
+function renderStats(res, seq, snrDb, driftPct, jammedBits) {
+  const dl = $('wb-stats'); dl.replaceChildren();
+  field(dl, 'Frame', res.bytes.length ? [...res.bytes].map(b => hex2(b)).join(' ') : 'not acquired');
+  field(dl, 'Payload', res.payload.length ? res.payload.map(b => hex2(b)).join(' ') + ` (seq ${res.sequence})` : 'none');
+  field(dl, 'CRC-8/SMBUS', res.syncOk ? `received 0x${hex2(res.crcReceived)} vs computed 0x${hex2(res.crcComputed)}` : 'sync not acquired');
+  field(dl, 'Channel', `${snrDb >= 35 ? 'clean' : `${snrDb} dB SNR`} room noise, ${driftPct === 0 ? 'nominal' : `${driftPct > 0 ? '+' : ''}${driftPct}%`} clock drift${jammedBits.length ? `, ${jammedBits.length} bit${jammedBits.length > 1 ? 's' : ''} jammed` : ''}`);
+  if (res.startSample >= 0) field(dl, 'Symbol rate', `${(48000 / res.symbolSamples).toFixed(1)} baud estimated (${res.symbolSamples.toFixed(0)} samples/symbol)`);
+  if (res.symbols.length) field(dl, 'Worst bit margin', `${res.minMarginDb.toFixed(1)} dB`);
+}
+
+function transmit() {
+  const snrDb = Number($('snr').value), driftPct = Number($('drift').value);
+  const reuse = $('replay').checked && wb.lastSeen >= 0;
+  const seq = reuse ? wb.lastSeen : wb.seq;
+  wb.seq = (wb.seq + 1) & 0xFF;
+  const frame = encodeFrame(seq), truth = frameBits(frame);
+  const synth = synthesize(truth, { sampleRate: 48000, clockDrift: driftPct / 100, leadSec: .06, trailSec: .06 });
+  let wave = synth.samples;
+  const jamAt = $('tamper').checked ? 40 + Math.floor(Math.random() * 40) : -1;
+  if (jamAt >= 0) wave = attackBit(wave, jamAt, synth);
+  wave = addAwgn(wave, snrDb, (Math.random() * 2 ** 31) >>> 0);
+  const res = decodeFrame(wave, { sampleRate: 48000 });
+  const jammed = res.bits.length === truth.length ? res.bits.map((b, i) => b !== truth[i].bit ? i : -1).filter(i => i >= 0) : [];
+  const replayed = res.ok && res.sequence === wb.lastSeen;
+  if (res.ok) wb.lastSeen = res.sequence;
+  wb.last = { wave, res };
+
+  const v = $('verdict');
+  if (res.verified) { v.textContent = `FRAME VERIFIED. CRC-8 pass, seq ${res.sequence}${replayed ? ' (replayed sequence)' : ''}.`; v.className = 'wb-verdict ok'; }
+  else if (res.ok) { v.textContent = `CRC PASS, preamble degraded. seq ${res.sequence}${replayed ? ' (replayed sequence)' : ''}.`; v.className = 'wb-verdict warn'; }
+  else if (res.syncOk && !res.crcOk) { v.textContent = `ATTACK DETECTED. ${jammed.length || 'A'} bit${jammed.length === 1 ? '' : 's'} flipped and CRC-8 rejected the frame.`; v.className = 'wb-verdict fail'; }
+  else { v.textContent = `NO FRAME. Sync word not acquired (${res.reason || 'channel too hostile'}).`; v.className = 'wb-verdict fail'; }
+
+  renderFrameMap(res, truth, true);
+  drawWave(wave, res); drawGoertzel(res, truth); drawSpectro(wave);
+  renderStats(res, seq, snrDb, driftPct, jammed);
+  renderTruth();
+}
+
+$('tx-btn').addEventListener('click', transmit);
+$('play-btn').addEventListener('click', () => {
+  if (!wb.last) return;
+  wb.audio = wb.audio || new (window.AudioContext || window.webkitAudioContext)();
+  const ctx = wb.audio, buf = ctx.createBuffer(1, wb.last.wave.length, 48000);
+  buf.getChannelData(0).set(wb.last.wave);
+  const src = ctx.createBufferSource(), gain = ctx.createGain();
+  gain.gain.value = .85;
+  src.buffer = buf; src.connect(gain); gain.connect(ctx.destination); src.start();
+});
+$('snr').addEventListener('input', () => { $('snr-out').textContent = `${$('snr').value} dB SNR`; });
+$('drift').addEventListener('input', () => { const d = Number($('drift').value); $('drift-out').textContent = d === 0 ? 'nominal' : `${d > 0 ? '+' : ''}${d}%`; });
+window.addEventListener('resize', () => { if (wb.last) { drawWave(wb.last.wave, wb.last.res); drawGoertzel(wb.last.res, null); drawSpectro(wb.last.wave); } });
+transmit();
 
 $('load-kicanvas').addEventListener('click', async () => {
   const button = $('load-kicanvas'); button.disabled = true; $('kicanvas-status').textContent = 'Loading optional external KiCanvas engine…';

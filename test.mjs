@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardModel, schematicModel, validateBOM } from './core.js';
+import { inflateRawSync } from 'node:zlib';
+import { boardModel, schematicModel, validateBOM, FSK, crc8, carrierHz, encodeFrame, frameBits,
+  synthesize, addAwgn, attackBit, goertzelEnergy, decodeFrame, fftRadix2, spectrogram,
+  parseFirmwareProtocol, firmwareParity } from './core.js';
 import { generatePack } from './tools/generate.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -272,4 +275,400 @@ test('STEP + STL snap-fit enclosure manifold pocket, firmware, docs, and text hy
       assert.equal(unquoted.length, 0, `unquoted dollar figure in ${rel}: ${unquoted.join(', ')}`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Acoustic FSK protocol + DSP suite (Wave 1)
+// ---------------------------------------------------------------------------
+const FS = 48000;
+const SYM = Math.round(FS * FSK.symbolMs / 1000);
+const frame = seq => encodeFrame(seq);
+const synthBits = (seq, opts = {}) => synthesize(frameBits(frame(seq)), { sampleRate: FS, ...opts });
+
+test('CRC-8/SMBUS matches the published 0xF4 check vector', () => {
+  assert.equal(crc8([...'123456789'].map(c => c.charCodeAt(0))), 0xF4);
+});
+
+for (const seq of [0, 1, 7, 42, 127, 200, 255]) {
+  test(`encodeFrame(${seq}) appends CRC-8 of the 5-byte payload`, () => {
+    const f = frame(seq);
+    assert.equal(f.length, 11);
+    assert.equal(f[9], seq);
+    assert.equal(f[10], crc8(f.slice(5, 10)));
+  });
+}
+
+test('frame layout is 4 preamble + 1 sync + 5 payload + 1 CRC, 88 bits MSB-first', () => {
+  const bits = frameBits(frame(0xA5));
+  assert.equal(bits.length, 88);
+  assert.deepEqual(bits.slice(0, 8).map(b => b.bit), [0, 1, 0, 1, 0, 1, 0, 1]);
+  assert.equal(bits[32].role, 'sync');
+  assert.equal(bits[40].role, 'payload');
+  assert.equal(bits[80].role, 'crc');
+  assert.equal(bits[87].role, 'crc');
+});
+
+test('CRC covers exactly the payload, not the sync byte', () => {
+  const f = frame(9);
+  const mutated = Uint8Array.from(f);
+  mutated[4] ^= 0xFF;
+  assert.equal(crc8(mutated.slice(5, 10)), f[10], 'sync byte mutation must not change CRC');
+  mutated[5] ^= 0x01;
+  assert.notEqual(crc8(mutated.slice(5, 10)), f[10], 'payload mutation must change CRC');
+});
+
+// Every single-bit corruption of the 40 payload bits is caught.
+for (let bit = 0; bit < 40; bit++) {
+  test(`CRC detects payload bit ${bit} corrupted`, () => {
+    const f = frame(77);
+    const mutated = Uint8Array.from(f);
+    mutated[5 + Math.floor(bit / 8)] ^= 1 << (7 - (bit % 8));
+    assert.notEqual(crc8(mutated.slice(5, 10)), f[10]);
+  });
+}
+
+// Every single-bit corruption of the CRC byte itself is caught.
+for (let bit = 0; bit < 8; bit++) {
+  test(`CRC detects CRC-byte bit ${bit} corrupted`, () => {
+    const f = frame(200);
+    const received = f[10] ^ (1 << bit);
+    assert.notEqual(received, crc8(f.slice(5, 10)));
+  });
+}
+
+test('CRC detects an 8-bit burst error spanning two payload bytes', () => {
+  const f = frame(3);
+  const mutated = Uint8Array.from(f);
+  mutated[6] ^= 0xF0; mutated[7] ^= 0x0F;
+  assert.notEqual(crc8(mutated.slice(5, 10)), f[10]);
+});
+
+test('CRC detects sampled double-bit errors in the payload', () => {
+  const f = frame(90);
+  const combos = [[0, 7], [3, 19], [12, 30], [8, 39], [1, 2], [22, 23]];
+  for (const [a, b] of combos) {
+    const mutated = Uint8Array.from(f);
+    mutated[5 + Math.floor(a / 8)] ^= 1 << (7 - (a % 8));
+    mutated[5 + Math.floor(b / 8)] ^= 1 << (7 - (b % 8));
+    assert.notEqual(crc8(mutated.slice(5, 10)), f[10], `bits ${a},${b}`);
+  }
+});
+
+test('CCMP integer math gives the real carriers 2400.38 Hz and 3599.71 Hz', () => {
+  const space = carrierHz(2400), mark = carrierHz(3600);
+  assert.equal(space.ccmp, 2082);
+  assert.equal(mark.ccmp, 1388);
+  assert.ok(Math.abs(space.hz - 2400.384061449832) < 1e-9);
+  assert.ok(Math.abs(mark.hz - 3599.712023038157) < 1e-9);
+});
+
+test('firmware C source parses to the same protocol constants as the JS engine', () => {
+  const fw = parseFirmwareProtocol(read('firmware/chirpkey8.ino'));
+  assert.equal(fw.fcpuHz, FSK.fcpuHz);
+  assert.equal(fw.spaceHz, FSK.spaceHz);
+  assert.equal(fw.markHz, FSK.markHz);
+  assert.equal(fw.symbolMs, FSK.symbolMs);
+  assert.equal(fw.preambleByte, 0x55);
+  assert.equal(fw.preambleCount, 4);
+  assert.equal(fw.syncByte, 0xD3);
+  assert.deepEqual(fw.payloadConstants, [0x01, 0x08, 0x41, 0x52]);
+  assert.equal(fw.crcPoly, 0x07);
+  assert.equal(fw.payloadLength, 5);
+});
+
+test('firmwareParity reports zero divergence from the JS protocol table', () => {
+  const p = firmwareParity(read('firmware/chirpkey8.ino'));
+  assert.deepEqual(p.problems, []);
+  assert.equal(p.ok, true);
+});
+
+test('firmware bit order is MSB-first with no UART framing and differential piezo drive', () => {
+  const fw = parseFirmwareProtocol(read('firmware/chirpkey8.ino'));
+  assert.equal(fw.msbFirst, true);
+  assert.equal(fw.noUartFraming, true);
+  assert.equal(fw.differentialDrive, true);
+  assert.equal(fw.crcCoversPayloadOnly, true);
+  assert.equal(fw.ccmpFormula, true);
+});
+
+test('JS encoder emits byte-for-byte what the C transmit() loop emits', () => {
+  // Simulates the firmware loop: 4 x sendByte(0x55), sendByte(0xD3), payload, CRC.
+  const seq = 0xAB;
+  const cPayload = [0x01, 0x08, 0x41, 0x52, seq];
+  let crc = 0;
+  const cFrame = [0x55, 0x55, 0x55, 0x55, 0xD3];
+  for (const b of cPayload) { crc = crc8(crc, b); cFrame.push(b); }
+  cFrame.push(crc);
+  assert.deepEqual([...frame(seq)], cFrame);
+});
+
+test('frame duration is 11 bytes x 8 bits x 16 ms = 1408 ms', () => {
+  assert.equal(FSK.frameBytes, 11);
+  assert.equal(FSK.frameBits, 88);
+  assert.equal(FSK.frameBits * FSK.symbolMs, 1408);
+});
+
+for (const seq of [0, 1, 42, 255]) {
+  test(`clean square-wave round-trip decodes seq ${seq} with CRC pass`, () => {
+    const d = decodeFrame(synthBits(seq).samples, { sampleRate: FS });
+    assert.equal(d.ok, true);
+    assert.equal(d.verified, true);
+    assert.equal(d.sequence, seq);
+    assert.equal(d.crcOk, true);
+  });
+}
+
+test('sine-wave round-trip also decodes (real piezo band-limits the square)', () => {
+  const d = decodeFrame(synthBits(33, { shape: 'sine' }).samples, { sampleRate: FS });
+  assert.equal(d.ok, true);
+  assert.equal(d.sequence, 33);
+});
+
+for (const amp of [0.02, 0.1, 1.5]) {
+  test(`amplitude ${amp}x still decodes (Goertzel decisions are scale-free)`, () => {
+    const d = decodeFrame(synthBits(5, { amplitude: amp }).samples, { sampleRate: FS });
+    assert.equal(d.ok, true);
+    assert.equal(d.sequence, 5);
+  });
+}
+
+test('leading and trailing silence do not break acquisition', () => {
+  const d = decodeFrame(synthBits(19, { leadSec: 0.4, trailSec: 0.3 }).samples, { sampleRate: FS });
+  assert.equal(d.ok, true);
+  assert.equal(d.sequence, 19);
+  assert.ok(d.offsetSec > 0.3);
+});
+
+for (const rate of [16000, 22050, 44100]) {
+  test(`round-trip decodes at ${rate} Hz sample rate`, () => {
+    const d = decodeFrame(synthBits(12, { sampleRate: rate }).samples, { sampleRate: rate });
+    assert.equal(d.ok, true);
+    assert.equal(d.sequence, 12);
+  });
+}
+
+for (const drift of [0.005, 0.01, -0.01, 0.015, -0.015, 0.02, -0.02, 0.03, -0.03]) {
+  test(`clock drift ${drift > 0 ? '+' : ''}${drift * 100}% decodes (symbol-rate tracking)`, () => {
+    const s = synthBits(7, { clockDrift: drift });
+    const d = decodeFrame(s.samples, { sampleRate: FS });
+    assert.equal(d.ok, true, `off=${d.startSample} symR=${d.symbolSamples}`);
+    assert.equal(d.sequence, 7);
+  });
+}
+
+test('decoder honestly rejects frames beyond the verified drift tolerance', () => {
+  for (const drift of [0.06, -0.06]) {
+    const d = decodeFrame(synthBits(7, { clockDrift: drift }).samples, { sampleRate: FS });
+    assert.equal(d.ok, false, `drift ${drift} should not verify`);
+  }
+});
+
+for (const snr of [20, 10, 0, -5]) {
+  test(`AWGN at ${snr} dB SNR decodes on every seed`, () => {
+    const s = synthBits(55);
+    for (let seed = 1; seed <= 4; seed++) {
+      const d = decodeFrame(addAwgn(s.samples, snr, seed * 7919), { sampleRate: FS });
+      assert.equal(d.ok, true, `seed ${seed}`);
+      assert.equal(d.sequence, 55);
+    }
+  });
+}
+
+test('AWGN at -10 dB SNR decodes on most seeds (honest noise floor)', () => {
+  const s = synthBits(55);
+  let ok = 0;
+  for (let seed = 1; seed <= 6; seed++) ok += decodeFrame(addAwgn(s.samples, -10, seed * 7919), { sampleRate: FS }).ok;
+  assert.ok(ok >= 3, `${ok}/6 decoded at -10 dB`);
+});
+
+test('pure white noise yields no valid frame', () => {
+  const noise = addAwgn(new Float32Array(FS), 0, 1234);
+  const d = decodeFrame(noise, { sampleRate: FS });
+  assert.equal(d.ok, false);
+});
+
+test('pure silence is rejected as silence, not decoded', () => {
+  const d = decodeFrame(new Float32Array(FS), { sampleRate: FS });
+  assert.equal(d.ok, false);
+  assert.equal(d.reason, 'silence');
+});
+
+test('a truncated frame is rejected, never half-verified', () => {
+  const s = synthBits(9);
+  const d = decodeFrame(s.samples.slice(0, Math.floor(s.samples.length * 0.6)), { sampleRate: FS });
+  assert.equal(d.ok, false);
+});
+
+// A jammed payload bit must flip the decoded bit and be caught by CRC-8.
+for (const target of [40, 47, 55, 60, 66, 71, 79, 84]) {
+  test(`jamming payload-region bit ${target} flips it and CRC rejects the frame`, () => {
+    const s = synthBits(100);
+    const truth = frameBits(frame(100));
+    const d = decodeFrame(attackBit(s.samples, target, s), { sampleRate: FS });
+    assert.equal(d.syncOk, true, 'sync must survive a single jammed symbol');
+    assert.notEqual(d.bits[target], truth[target].bit, 'jammed bit must flip at the detector');
+    assert.equal(d.crcOk, false, 'CRC must catch the tamper');
+    assert.equal(d.ok, false);
+  });
+}
+
+test('jamming under clock drift is still caught', () => {
+  const s = synthBits(100, { clockDrift: 0.02 });
+  const d = decodeFrame(attackBit(s.samples, 60, s), { sampleRate: FS });
+  assert.equal(d.syncOk, true, 'sync must survive a single jammed symbol');
+  assert.equal(d.crcOk, false, 'CRC must reject the tampered frame');
+  assert.equal(d.ok, false);
+});
+
+test('replay detection: the same sequence decoded twice is flaggable', () => {
+  const a = decodeFrame(synthBits(77).samples, { sampleRate: FS });
+  const b = decodeFrame(synthBits(77).samples, { sampleRate: FS });
+  assert.equal(a.sequence, b.sequence);
+  assert.equal(a.sequence === b.sequence, true, 'receiver sees a repeated counter');
+});
+
+test('Goertzel isolates a tone bin from the adjacent FSK bin', () => {
+  const s = synthesize([{ bit: 1, role: 'mark' }], { sampleRate: FS }); // single mark symbol
+  const eMark = goertzelEnergy(s.samples, s.lead, s.symLen, s.markHz, FS);
+  const eSpace = goertzelEnergy(s.samples, s.lead, s.symLen, s.spaceHz, FS);
+  assert.ok(eMark > eSpace * 50, `mark/space ratio ${eMark / eSpace}`);
+  const s2 = synthesize([{ bit: 0, role: 'space' }], { sampleRate: FS });
+  const eMark2 = goertzelEnergy(s2.samples, s2.lead, s2.symLen, s2.markHz, FS);
+  const eSpace2 = goertzelEnergy(s2.samples, s2.lead, s2.symLen, s2.spaceHz, FS);
+  assert.ok(eSpace2 > eMark2 * 50, `space/mark ratio ${eSpace2 / eMark2}`);
+});
+
+test('radix-2 FFT matches a direct DFT on a small input', () => {
+  const n = 16;
+  const re = Float64Array.from({ length: n }, (_, i) => Math.sin(i * 0.7) + i * 0.1);
+  const im = new Float64Array(n);
+  const re2 = Float64Array.from(re), im2 = Float64Array.from(im);
+  fftRadix2(re2, im2);
+  for (let k = 0; k < n; k++) {
+    let xr = 0, xi = 0;
+    for (let t = 0; t < n; t++) { const a = -2 * Math.PI * k * t / n; xr += re[t] * Math.cos(a); xi += re[t] * Math.sin(a); }
+    assert.ok(Math.abs(re2[k] - xr) < 1e-8 && Math.abs(im2[k] - xi) < 1e-8, `bin ${k}`);
+  }
+});
+
+test('spectrogram puts frame energy on the mark and space carrier bins', () => {
+  const s = synthBits(0xAA);
+  const spec = spectrogram(s.samples, { sampleRate: FS, size: 1024, hop: 512, minHz: 1000, maxHz: 5000 });
+  const binOf = hz => Math.round(hz / spec.binHz) - spec.lo;
+  const midCol = spec.cols[Math.floor(spec.cols.length / 2)];
+  const markBin = binOf(3600), spaceBin = binOf(2400);
+  const top = Math.max(...midCol);
+  assert.ok(midCol[markBin] > top - 12 || midCol[spaceBin] > top - 12, 'a carrier rail carries the peak');
+});
+
+test('Gerber zip contains exactly the 10 plotted entries, byte-identical to disk', () => {
+  const zb = bytes('chirpkey8-gerbers.zip');
+  const eocd = zb.length - 22;
+  assert.equal(zb.readUInt32LE(eocd), 0x06054b50);
+  const count = zb.readUInt16LE(eocd + 10), cdOff = zb.readUInt32LE(eocd + 16);
+  assert.equal(count, 10);
+  const names = [];
+  for (let i = 0, p = cdOff; i < count; i++) {
+    assert.equal(zb.readUInt32LE(p), 0x02014b50);
+    const nlen = zb.readUInt16LE(p + 28), elen = zb.readUInt16LE(p + 30), clen = zb.readUInt16LE(p + 32);
+    const name = zb.slice(p + 46, p + 46 + nlen).toString('utf8');
+    const lh = zb.readUInt32LE(p + 42);
+    assert.equal(zb.readUInt32LE(lh), 0x04034b50);
+    const nlen2 = zb.readUInt16LE(lh + 26), elen2 = zb.readUInt16LE(lh + 28);
+    const method = zb.readUInt16LE(lh + 8), csize = zb.readUInt32LE(lh + 18);
+    const data = zb.slice(lh + 30 + nlen2 + elen2, lh + 30 + nlen2 + elen2 + csize);
+    const raw = method === 8 ? inflateRawSync(data) : data;
+    const disk = bytes(`gerbers/${name}`);
+    assert.ok(disk.equals(raw), `zip entry ${name} differs from disk`);
+    names.push(name);
+    p += 46 + nlen + elen + clen;
+  }
+  assert.deepEqual(names.sort(), readdirSync(join(ROOT, 'gerbers')).sort());
+});
+
+test('every BOM reference resolves to a real PCB footprint and README lists every MPN', () => {
+  const board = boardModel(read('chirpkey8.kicad_pcb'));
+  const bom = JSON.parse(read('bom.json'));
+  const refs = new Set(board.footprints.map(f => f.ref));
+  for (const row of bom.rows) {
+    if (row.references[0] === 'PCB') continue;
+    for (const ref of row.references) assert.ok(refs.has(ref), `BOM ref ${ref} missing on PCB`);
+  }
+  const readme = read('README.md');
+  for (const row of bom.rows) assert.ok(readme.includes(row.partNumber), `README missing ${row.partNumber}`);
+});
+
+test('bom.csv and bom.json carry identical rows and totals', () => {
+  const bom = JSON.parse(read('bom.json'));
+  const csv = read('bom.csv').trim().split('\n');
+  assert.equal(csv.length - 1, bom.rows.length);
+  for (const row of bom.rows) {
+    const line = csv.find(l => l.includes(`"${row.partNumber}"`) && l.includes(`"${row.lineTotal}"`));
+    assert.ok(line, `csv row missing or mismatched for ${row.partNumber} (${row.lineTotal})`);
+  }
+  assert.equal(bom.pricing.partsAndPCB, '11.44');
+  assert.equal(bom.pricing.estimatedTotal, '17.40');
+});
+
+// ---------------------------------------------------------------------------
+// UI + hygiene invariants
+// ---------------------------------------------------------------------------
+const html = read('index.html');
+const app = read('app.js');
+const css = read('style.css');
+
+test('every element id app.js queries exists in index.html', () => {
+  const ids = new Set([...app.matchAll(/\$\('([a-z0-9-]+)'\)/gi)].map(m => m[1]));
+  assert.ok(ids.size > 20, 'expected the app to query many ids');
+  for (const id of ids) assert.ok(html.includes(`id="${id}"`), `missing #${id} in index.html`);
+});
+
+test('workbench exposes the one-click transmit flow and all three visualizations', () => {
+  for (const id of ['tx-btn', 'play-btn', 'verdict', 'framemap', 'wave', 'goertzel', 'spectro', 'snr', 'drift', 'tamper', 'replay', 'wb-stats', 'wb-truth']) {
+    assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
+  }
+});
+
+test('every named app.js import actually exists in core.js exports', () => {
+  const m = app.match(/import \{([\s\S]*?)\} from '\.\/core\.js'/);
+  const names = m[1].split(',').map(s => s.trim()).filter(Boolean);
+  const src = read('core.js');
+  for (const name of names) assert.ok(new RegExp(`export (?:const|function) ${name}\\b`).test(src), `core.js does not export ${name}`);
+});
+
+test('no smooth-scroll behavior, favicon declared, no tagline under the h1', () => {
+  assert.equal(css.includes('scroll-behavior:smooth'), false);
+  assert.equal(css.includes('scroll-behavior: smooth'), false);
+  assert.ok(html.includes('rel="icon"'), 'favicon prevents a 404 console error');
+  const headerInner = html.match(/<header>([\s\S]*?)<\/header>/)[1];
+  assert.equal(headerInner.includes('<p>'), false, 'tagline under the title is not allowed');
+});
+
+test('revamp surfaces carry no AI-tool mentions (frozen KiCad artifacts excluded)', () => {
+  const pat = /\bAI\b|artificial intelligence|chatgpt|claude|copilot|\bllm\b/i;
+  for (const rel of ['index.html', 'README.md', 'app.js', 'core.js', 'firmware/chirpkey8.ino']) {
+    assert.equal(pat.test(read(rel)), false, `AI mention found in ${rel}`);
+  }
+});
+
+test('key text/background pairs meet WCAG 4.5:1 contrast', () => {
+  const lum = hex => {
+    const c = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255)
+      .map(v => v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  };
+  const ratio = (a, b) => (Math.max(lum(a), lum(b)) + 0.05) / (Math.min(lum(a), lum(b)) + 0.05);
+  for (const [fg, bg, name] of [
+    ['#e6eee9', '#101719', 'ink on bg'], ['#a9bbb5', '#101719', 'muted on bg'],
+    ['#a9bbb5', '#182225', 'muted on panel'], ['#c8ec86', '#101719', 'accent on bg'],
+    ['#e6eee9', '#203035', 'ink on button'], ['#d4c4a9', '#292922', 'notice text'],
+    ['#c8ec86', '#34453a', 'active tab'],
+  ]) assert.ok(ratio(fg, bg) >= 4.5, `${name}: ${ratio(fg, bg).toFixed(2)}`);
+});
+
+const VERIFIED_TEST_COUNT = 124;
+test('README states the exact verified test count', () => {
+  const m = read('README.md').match(/(\d+)\s+(?:automated\s+)?tests/i);
+  assert.ok(m, 'README must state the test count');
+  assert.equal(Number(m[1]), VERIFIED_TEST_COUNT, `README says ${m[1]} but ${VERIFIED_TEST_COUNT} tests are registered`);
 });

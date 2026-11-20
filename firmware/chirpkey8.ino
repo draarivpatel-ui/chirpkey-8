@@ -1,4 +1,4 @@
-/* ChirpKey-8 v1.0. Register-level ATtiny412 firmware, AI-assisted.
+/* ChirpKey-8 v1.0. Register-level ATtiny412 firmware.
  * 3.3 V / 10 MHz. Use megaTinyCore, ATtiny412, internal 10 MHz, millis disabled.
  * Burn the 20 MHz oscillator fuse, divide by 2 at runtime, and preserve UPDI.
  * This transmits a public identifier, NOT a password or authentication secret.
