@@ -204,7 +204,7 @@ async function start() {
 const wb = { seq: 0, lastSeen: -1, last: null, audio: null };
 const wbTruth = { bom: '' };
 const TONE = { mark: '#c8ec86', space: '#75b8ee' };
-const ROLE_COLOR = { preamble: '#5d6f68', sync: '#f2b675', payload: '#c8ec86', crc: '#e4ce8b' };
+const ROLE_COLOR = { preamble: '#75857e', sync: '#f2b675', payload: '#c8ec86', crc: '#e4ce8b' };
 const hex2 = b => (b >>> 0).toString(16).padStart(2, '0').toUpperCase();
 
 function renderTruth(extra = '') {
@@ -232,7 +232,7 @@ function drawWave(samples, res) {
     let mn = Infinity, mx = -Infinity;
     for (let s = s0; s < s1 && s < n; s += step) { if (samples[s] < mn) mn = samples[s]; if (samples[s] > mx) mx = samples[s]; }
     const b = bitOf(s0);
-    ctx.strokeStyle = b >= 0 && b < res.bits.length ? (res.bits[b] ? TONE.mark : TONE.space) : '#3d4c48';
+    ctx.strokeStyle = b >= 0 && b < res.bits.length ? (res.bits[b] ? TONE.mark : TONE.space) : '#56665f';
     ctx.globalAlpha = b >= 0 && b < res.bits.length ? .9 : .45;
     ctx.beginPath(); ctx.moveTo(px + .5, mid + mn * mid * .92); ctx.lineTo(px + .5, mid + mx * mid * .92); ctx.stroke();
   }
@@ -291,7 +291,9 @@ function drawSpectro(samples) {
     const y = h - (hz / 48000 * spec.size - spec.lo) * bh;
     ctx.strokeStyle = 'rgba(230,238,233,.5)'; ctx.setLineDash([4, 4]);
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = '#e6eee9'; ctx.font = '10px ui-monospace,monospace'; ctx.fillText(name, 6, y - 3);
+    ctx.fillStyle = 'rgba(16,23,25,.78)';
+    ctx.fillRect(4, y - 13, ctx.measureText(name).width + 10, 15);
+    ctx.fillStyle = '#e6eee9'; ctx.font = '10px ui-monospace,monospace'; ctx.fillText(name, 9, y - 3);
   }
 }
 
@@ -310,7 +312,7 @@ function renderFrameMap(res, truthBits, reveal) {
       chip.className = 'bit';
       const val = i < res.bits.length ? res.bits[i] : '?';
       chip.textContent = val;
-      chip.style.background = ROLE_COLOR[res.symbols[i]?.role] || '#617770';
+      chip.style.background = ROLE_COLOR[res.symbols[i]?.role] || '#75857e';
       if (truthBits?.[i] && truthBits[i].bit !== val) chip.classList.add('err');
       if (reveal) { chip.classList.add('hide'); chip.style.transitionDelay = `${i * 9}ms`; }
       row.append(chip);
@@ -343,15 +345,23 @@ function transmit() {
   wave = addAwgn(wave, snrDb, (Math.random() * 2 ** 31) >>> 0);
   const res = decodeFrame(wave, { sampleRate: 48000 });
   const jammed = res.bits.length === truth.length ? res.bits.map((b, i) => b !== truth[i].bit ? i : -1).filter(i => i >= 0) : [];
+  const attackArmed = $('tamper').checked;
   const replayed = res.ok && res.sequence === wb.lastSeen;
   if (res.ok) wb.lastSeen = res.sequence;
   wb.last = { wave, res };
 
   const v = $('verdict');
-  if (res.verified) { v.textContent = `FRAME VERIFIED. CRC-8 pass, seq ${res.sequence}${replayed ? ' (replayed sequence)' : ''}.`; v.className = 'wb-verdict ok'; }
-  else if (res.ok) { v.textContent = `CRC PASS, preamble degraded. seq ${res.sequence}${replayed ? ' (replayed sequence)' : ''}.`; v.className = 'wb-verdict warn'; }
-  else if (res.syncOk && !res.crcOk) { v.textContent = `ATTACK DETECTED. ${jammed.length || 'A'} bit${jammed.length === 1 ? '' : 's'} flipped and CRC-8 rejected the frame.`; v.className = 'wb-verdict fail'; }
-  else { v.textContent = `NO FRAME. Sync word not acquired (${res.reason || 'channel too hostile'}).`; v.className = 'wb-verdict fail'; }
+  const replayNote = replayed ? ' (replayed sequence)' : '';
+  if (res.verified) {
+    v.textContent = `FRAME VERIFIED. CRC-8 pass, seq ${res.sequence}${replayNote}.${attackArmed ? ' Bit-flip attack had no effect on the decoded frame.' : ''}`;
+    v.className = 'wb-verdict ok';
+  } else if (res.ok) { v.textContent = `CRC PASS, preamble degraded. seq ${res.sequence}${replayNote}.`; v.className = 'wb-verdict warn'; }
+  else if (res.syncOk && !res.crcOk) {
+    v.textContent = attackArmed
+      ? `ATTACK DETECTED. ${jammed.length || 'A'} bit${jammed.length === 1 ? '' : 's'} flipped and CRC-8 rejected the frame.`
+      : `CRC-8 FAILED. ${jammed.length || 'Channel'} bit${jammed.length === 1 ? '' : 's'} corrupted by noise or drift, not a bit-flip attack.`;
+    v.className = 'wb-verdict fail';
+  } else { v.textContent = `NO FRAME. Sync word not acquired (${res.reason || 'channel too hostile'}).`; v.className = 'wb-verdict fail'; }
 
   renderFrameMap(res, truth, true);
   drawWave(wave, res); drawGoertzel(res, truth); drawSpectro(wave);
@@ -378,7 +388,7 @@ $('load-kicanvas').addEventListener('click', async () => {
   const button = $('load-kicanvas'); button.disabled = true; $('kicanvas-status').textContent = 'Loading optional external KiCanvas engine…';
   try {
     await new Promise((resolve, reject) => {
-      const script = document.createElement('script'); script.type = 'module'; script.src = 'https://kicanvas.org/kicanvas.js';
+      const script = document.createElement('script'); script.type = 'module'; script.src = 'https://kicanvas.org/kicanvas/kicanvas.js';
       const timeout = setTimeout(() => reject(new Error('KiCanvas network timeout')), 15000);
       script.onload = () => { clearTimeout(timeout); resolve(); }; script.onerror = () => { clearTimeout(timeout); script.remove(); reject(new Error('KiCanvas network request failed')); };
       document.head.append(script);

@@ -218,6 +218,9 @@ export function decodeFrame(samples, opts = {}) {
   const spaceHz = firmwareCarriers ? carrierHz(proto.spaceHz, proto.fcpuHz).hz : proto.spaceHz;
   const symLen = Math.round(sampleRate * proto.symbolMs / 1000);
   const nBits = proto.frameBits, frameLen = nBits * symLen;
+  for (let i = 0; i < samples.length; i++) {
+    if (!Number.isFinite(samples[i])) return emptyDecode('signal-not-finite');
+  }
   if (samples.length < symLen * 2) return emptyDecode('signal-too-short');
 
   const half = Math.max(16, Math.floor(symLen / 2)), hop = Math.max(1, Math.floor(half / 2));
@@ -235,11 +238,12 @@ export function decodeFrame(samples, opts = {}) {
   // symbol, so least-squares on transition times recovers both the frame
   // start and the true symbol rate under clock drift.
   const template = frameBits(Uint8Array.from([...proto.preambleBytes, proto.syncByte]), proto).map(b => b.bit);
-  const bitEnergy = (off, symR, i, out) => {
+  const nominalSym = sampleRate * proto.symbolMs / 1000;
+  const bitEnergy = (off, symR, i, out, mHz = markHz, sHz = spaceHz) => {
     const win = Math.round(symR * 0.8), st = Math.round(off + (i + 0.5) * symR - win / 2);
     if (st < 0 || st + win > samples.length) return false;
-    out[0] = goertzelEnergy(samples, st, win, markHz, sampleRate);
-    out[1] = goertzelEnergy(samples, st, win, spaceHz, sampleRate);
+    out[0] = goertzelEnergy(samples, st, win, mHz, sampleRate);
+    out[1] = goertzelEnergy(samples, st, win, sHz, sampleRate);
     return true;
   };
   const buf = [0, 0];
@@ -252,11 +256,24 @@ export function decodeFrame(samples, opts = {}) {
     return score;
   };
   const rankCand = cand => {
+    // A drifted transmitter shifts its carriers by the same ratio as its
+    // symbol rate (one clock drives both), so each candidate alignment
+    // evaluates tones at drift-scaled frequencies. This restores decisive
+    // per-bit margins under clock drift, keeping the undecided-window gate
+    // honest for wide sweeps.
+    const rate = nominalSym / cand.symR;
+    const mHz = markHz * rate, sHz = spaceHz * rate;
     const bytes = [];
+    let undecided = 0;
     for (let by = 0; by < proto.frameBytes; by++) {
       let v = 0;
       for (let b = 0; b < 8; b++) {
-        if (!bitEnergy(cand.off, cand.symR, by * 8 + b, buf)) return { rank: -Infinity };
+        if (!bitEnergy(cand.off, cand.symR, by * 8 + b, buf, mHz, sHz)) return { rank: -Infinity };
+        const hi = Math.max(buf[0], buf[1]), lo = Math.min(buf[0], buf[1]);
+        // A window straddling a carrier transition hears both tones strongly;
+        // a noise-dominated window also has a weak signal, so only windows
+        // carrying real energy against the acquisition peak count.
+        if (lo >= 0.25 * hi && hi >= 0.02 * peak) undecided++;
         v = (v << 1) | (buf[0] > buf[1] ? 1 : 0);
       }
       bytes.push(v);
@@ -265,14 +282,18 @@ export function decodeFrame(samples, opts = {}) {
     const pm = proto.preambleBytes.reduce((n, p, i) => n + (bytes[i] === p ? 1 : 0), 0);
     const syncOkB = bytes[syncAt] === proto.syncByte;
     const crcOkB = crc8(bytes.slice(syncAt + 1, syncAt + 1 + proto.payloadLength)) === bytes[proto.frameBytes - 1];
-    // A CRC-valid alignment is ground truth: every one of the 88 bit windows
-    // landed right. Structure match and soft score break the ties.
-    // A CRC-valid payload only counts as the best evidence when the sync byte
-    // also lands: an 8-bit CRC validates by chance ~1/256 of the time, so a
-    // misaligned garbage candidate must never outrank a structurally valid
-    // (sync-good) frame that was genuinely jammed mid-payload.
-    const rank = (syncOkB && crcOkB ? 1e15 : 0) + (syncOkB ? 1e12 : 0) + (crcOkB ? 1e9 : 0) + pm * 1e6 + cand.score;
-    return { rank, ...cand };
+    // A CRC-valid alignment is ground truth only when its 88 bit windows
+    // actually decided a tone. A misaligned grid straddles carrier
+    // transitions, so many of its windows hear both tones at once; a true
+    // alignment decides every window except one genuinely jammed symbol.
+    // Measured on this protocol: true alignments leave 0-1 undecided windows,
+    // CRC-lucky phantom grids leave 8-16, so 4 separates them with margin.
+    // Without this gate a phantom whose payload bytes happen to satisfy the
+    // CRC outranks the true alignment and fake-verifies a corrupted frame.
+    const trust = undecided < 4;
+    const rank = (syncOkB && crcOkB && trust ? 1e15 : 0) + (syncOkB && trust ? 1e12 : 0)
+      + (crcOkB && trust ? 1e9 : 0) + pm * 1e6 + cand.score;
+    return { rank, undecided, driftScale: rate, ...cand };
   };
 
   const sub = Math.max(8, Math.floor(symLen / 4));
@@ -337,14 +358,20 @@ export function decodeFrame(samples, opts = {}) {
     const period = den && n >= 3 ? (n * sxy - sx * sy) / den : symEst;
     const first = den ? (sy - period * sx) / n : times[0];
     // The first detected transition is one symbol after the frame start, but
-    // an early boundary can be missed: try a few integer symbol shifts and
-    // let decoded preamble+sync structure choose.
+    // an early boundary can be missed and the least-squares fit is biased
+    // under clock drift: sweep generously around the fitted grid so the true
+    // alignment is always enumerated. A symbol-rate candidate must land
+    // within ~0.13% of the true rate or the accumulated window error at bit
+    // 87 starts straddling carrier transitions, hence the 0.25% step; the
+    // +/-2% range covers LSQ period bias well beyond the verified +/-3.5%
+    // drift tolerance. CRC-lucky phantom grids the wide sweep invites are
+    // demoted by the undecided-window gate inside rankCand.
     for (let back = 0; back <= 4; back++) {
       const offC = first - (back + 1) * period;
-      for (let dOff = -48; dOff <= 48; dOff += 8) {
+      for (let dOff = -96; dOff <= 96; dOff += 8) {
         const off0 = Math.round(offC + dOff);
         if (off0 < 0 || off0 > lastStart) continue;
-        for (let ds = -0.0075; ds <= 0.007501; ds += 0.0025) {
+        for (let ds = -0.02; ds <= 0.020001; ds += 0.0025) {
           const symR = period * (1 + ds);
           const r = rankCand({ off: off0, symR, score: scaleScore(off0, symR) });
           if (r.rank > winner.rank) winner = r;
@@ -380,12 +407,13 @@ export function decodeFrame(samples, opts = {}) {
   if (!isFinite(winner.rank)) return emptyDecode('no-sync');
   const off = winner.off, symR = winner.symR;
   const win = Math.round(symR * 0.8);
+  const mHz = markHz * winner.driftScale, sHz = spaceHz * winner.driftScale;
   const symbols = [], bits = [];
   let minMarginDb = Infinity;
   for (let i = 0; i < nBits; i++) {
     const st = Math.round(off + (i + 0.5) * symR - win / 2);
-    const m = goertzelEnergy(samples, st, win, markHz, sampleRate);
-    const s = goertzelEnergy(samples, st, win, spaceHz, sampleRate);
+    const m = goertzelEnergy(samples, st, win, mHz, sampleRate);
+    const s = goertzelEnergy(samples, st, win, sHz, sampleRate);
     const bit = m > s ? 1 : 0, marginDb = 10 * Math.abs(Math.log10((m + 1e-30) / (s + 1e-30)));
     symbols.push({ bit, mark: m, space: s, marginDb, role: i < 32 ? 'preamble' : i < 40 ? 'sync' : i < 80 ? 'payload' : 'crc' });
     bits.push(bit);
@@ -415,11 +443,13 @@ export function decodeFrame(samples, opts = {}) {
 
 // Waveform-level tamper: jam one symbol window with a strong burst of the
 // opposite protocol tone, as an acoustic interference attack on a receiver.
-// Injects the nominal carriers a receiver actually listens for.
+// When the caller passes a synthesize() result, its markHz/spaceHz already
+// include the transmitter clock drift, so the burst models a jammer locked
+// onto the same acquisition the decoder runs, not a blind nominal-tone burst.
 export function attackBit(samples, bitIndex, o) {
   const { lead, symLen, sampleRate, amplitude = 1.2, proto = FSK } = o;
-  const markHz = carrierHz(proto.markHz, proto.fcpuHz).hz;
-  const spaceHz = carrierHz(proto.spaceHz, proto.fcpuHz).hz;
+  const markHz = o.markHz ?? carrierHz(proto.markHz, proto.fcpuHz).hz;
+  const spaceHz = o.spaceHz ?? carrierHz(proto.spaceHz, proto.fcpuHz).hz;
   const off = lead + bitIndex * symLen;
   if (off < 0 || off >= samples.length) throw new Error('attackBit out of range');
   const flipTo = goertzelEnergy(samples, off, symLen, markHz, sampleRate) > goertzelEnergy(samples, off, symLen, spaceHz, sampleRate) ? spaceHz : markHz;

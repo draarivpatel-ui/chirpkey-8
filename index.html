@@ -59,7 +59,7 @@
       </div>
     </section>
     <section class="files"><h2>The engineering files</h2><nav aria-label="Artifact downloads"><a href="chirpkey8.kicad_pro" download>KiCad project</a><a href="chirpkey8.kicad_sch" download>Schematic</a><a href="chirpkey8.kicad_pcb" download>PCB</a><a href="chirpkey8-gerbers.zip" download>Gerber ZIP</a><a href="cad/chirpkey8_enclosure.step" download>Enclosure STEP</a><a href="bom.csv" download>BOM CSV</a><a href="bom.json" download>BOM JSON</a><a href="firmware/chirpkey8.ino" download>Firmware</a><a href="JOURNAL.md">Journal plan</a></nav></section>
-    <section class="kicanvas"><h2>Open with KiCanvas</h2><p>The default explorer renders the local KiCad source without external requests. This optional button loads the actual KiCanvas engine from kicanvas.org. It needs a network connection.</p><button id="load-kicanvas" type="button">Load KiCanvas PCB + schematic</button><p id="kicanvas-status" role="status"></p><div id="kicanvas-host"></div></section>
+    <section class="kicanvas"><h2>Open with KiCanvas</h2><p>The default explorer renders the local KiCad source without external requests. This optional button loads the actual KiCanvas engine from kicanvas.org. It needs a network connection, and its third-party parser currently rejects some shorthand decimals in this pack, so its embedded viewers may log their own parse errors. The local explorer remains the canonical view.</p><button id="load-kicanvas" type="button">Load KiCanvas PCB + schematic</button><p id="kicanvas-status" role="status"></p><div id="kicanvas-host"></div></section>
     <footer>Public identifier transmitter, not a security key. No fabrication, measured acoustics, human work hours or grant approval claimed.</footer>
   </main>
 </body>

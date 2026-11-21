@@ -666,7 +666,89 @@ test('key text/background pairs meet WCAG 4.5:1 contrast', () => {
   ]) assert.ok(ratio(fg, bg) >= 4.5, `${name}: ${ratio(fg, bg).toFixed(2)}`);
 });
 
-const VERIFIED_TEST_COUNT = 124;
+// ---------------------------------------------------------------------------
+// Wave 2 hardening regressions
+// ---------------------------------------------------------------------------
+test('NaN or Infinity in the audio buffer is rejected, never decoded', () => {
+  const s = synthBits(9).samples;
+  for (const [name, poison] of [['NaN', NaN], ['Infinity', Infinity]]) {
+    const bad = Float32Array.from(s);
+    bad[3000] = poison;
+    const d = decodeFrame(bad, { sampleRate: FS });
+    assert.equal(d.ok, false, `${name}-poisoned buffer must not decode`);
+    assert.equal(d.reason, 'signal-not-finite');
+    assert.equal(d.verified, false);
+  }
+});
+
+// Single-bit payload mutations must never fake-verify: the decoder's
+// alignment search used to accept a CRC-lucky misaligned grid whose windows
+// straddle carrier transitions. The undecided-window gate demotes those.
+for (let k = 0; k < 6; k++) {
+  const seq = (37 * k + 11) & 0xFF;
+  for (let byteIdx = 5; byteIdx <= 10; byteIdx++) {
+    for (let bit = 0; bit < 8; bit++) {
+      test(`mutated frame byte ${byteIdx} bit ${bit} (seq ${seq}) never fake-verifies`, () => {
+        const f = frame(seq);
+        const mut = Uint8Array.from(f);
+        mut[byteIdx] ^= 1 << (7 - bit);
+        const bits = [];
+        mut.forEach(byte => { for (let b = 7; b >= 0; b--) bits.push({ bit: (byte >> b) & 1, role: 'payload' }); });
+        const s = synthesize(bits, { sampleRate: FS });
+        const d = decodeFrame(s.samples, { sampleRate: FS });
+        // A single-bit corruption anywhere in the CRC-protected region
+        // (payload bytes 5..9 plus the CRC byte itself) must be rejected.
+        assert.equal(d.ok, false, `fake verify at byte ${byteIdx} bit ${bit}: seq ${d.sequence}`);
+      });
+    }
+  }
+}
+
+test('drift-scaled carriers keep worst-bit margins decisive at 3% drift', () => {
+  const s = synthBits(7, { clockDrift: -0.03 });
+  const d = decodeFrame(s.samples, { sampleRate: FS });
+  assert.equal(d.ok, true);
+  assert.ok(d.minMarginDb > 6, `minMarginDb ${d.minMarginDb?.toFixed(1)} should be decisive, not straddling`);
+});
+
+test('drift + noise combined round-trips decode across seeds', () => {
+  for (const [drift, snr] of [[0.03, 10], [-0.03, 10], [0.03, 0], [-0.03, 0], [0.035, 10]]) {
+    const s = synthBits(55, { clockDrift: drift });
+    for (let seed = 1; seed <= 3; seed++) {
+      const d = decodeFrame(addAwgn(s.samples, snr, seed * 7919), { sampleRate: FS });
+      assert.equal(d.ok, true, `drift ${drift} snr ${snr} seed ${seed}`);
+      assert.equal(d.sequence, 55);
+    }
+  }
+});
+
+test('jamming any payload bit at 3.5% drift flips it and CRC rejects', () => {
+  const s = synthBits(100, { clockDrift: 0.035 });
+  const truth = frameBits(frame(100));
+  for (const target of [45, 55, 65, 75]) {
+    const d = decodeFrame(attackBit(s.samples, target, s), { sampleRate: FS });
+    assert.equal(d.syncOk, true, `bit ${target}: sync must survive`);
+    assert.equal(d.bits[target], truth[target].bit ? 0 : 1, `bit ${target} must flip`);
+    assert.equal(d.crcOk, false, `bit ${target}: CRC must reject`);
+  }
+});
+
+test('frame-map preamble chips meet WCAG 4.5:1 contrast against chip text', () => {
+  const app = read('app.js');
+  const m = app.match(/ROLE_COLOR = \{([^}]*)\}/);
+  assert.ok(m, 'ROLE_COLOR table found');
+  const lum = hex => {
+    const c = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255)
+      .map(v => v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  };
+  const ratio = (a, b) => (Math.max(lum(a), lum(b)) + 0.05) / (Math.min(lum(a), lum(b)) + 0.05);
+  for (const color of m[1].match(/#[0-9a-f]{6}/gi)) {
+    assert.ok(ratio('#101719', color) >= 4.5, `chip text on ${color}: ${ratio('#101719', color).toFixed(2)}`);
+  }
+});
+
+const VERIFIED_TEST_COUNT = 417;
 test('README states the exact verified test count', () => {
   const m = read('README.md').match(/(\d+)\s+(?:automated\s+)?tests/i);
   assert.ok(m, 'README must state the test count');
